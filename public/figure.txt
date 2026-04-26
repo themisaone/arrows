@@ -1,0 +1,45 @@
+# ====================================================================
+# Figure script. Loaded into the textarea on first load.
+# Edit live in the app; press Reset to restore this default.
+# ====================================================================
+
+# --------------------------------------------------------------------
+# Scale & bands (percent spans are half-widths: 20 => 80%..120% of center)
+# --------------------------------------------------------------------
+
+# Average length of distance in shape-triangles
+const averageSize         120
+## Percentage in variation (meaning: from 120 - 180)
+const averageSpan         20
+
+# Average height of tube  (50% of size above)
+const tubeAverageHeight   50
+## Percentage in variation (meaning: from 80 - 120)
+const tubeAverageSpan     20
+
+const topDisplacement     60
+
+# Bends (dimensionless)
+const bigBend        0.24
+const smallBend      0.16
+const tubeBend       0.06
+const distance       0.20
+
+# Compact layout for nesting several shapes on one page
+point A 400 300
+point B 380 420
+point C 520 380
+
+myShape A B C out in in
+
+# nest T*a T*b: infers …c; apex ⊥ away from that tube edge's triangle body (opening)
+nest T1a T1b
+
+nest T2a T2b
+nest T3a T3b
+nest T4a T4b
+nest T5a T5b
+nest T6a T6b
+
+dot A B C
+
