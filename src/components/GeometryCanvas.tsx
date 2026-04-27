@@ -222,12 +222,11 @@ const GeometryCanvas: React.FC = () => {
   };
 
   const scene = useMemo(() => {
-    const mini = parse(script, undefined, parseOpts).figure;
     return new Group([
       displayFigure,
-      new Group([mini], "translate(840 40) scale(0.18)"),
+      new Group([fullParse.figure], "translate(840 40) scale(0.18)"),
     ]);
-  }, [displayFigure, script, parseOpts]);
+  }, [displayFigure, fullParse.figure]);
 
   const handles: Array<{ name: string; x: number; y: number }> = [];
   for (const name of fullParse.freePoints) {
@@ -378,6 +377,15 @@ const GeometryCanvas: React.FC = () => {
             <span className="text-slate-400 font-normal">
               {fullParse.freePoints.length} point
               {fullParse.freePoints.length === 1 ? "" : "s"}
+              {(fullParse.infos?.length ?? 0) > 0 && (
+                <span
+                  className="text-sky-700"
+                  title="Nest apex clearance / retry notes (see panel below)"
+                >
+                  {" "}
+                  · nest notes {fullParse.infos!.length}
+                </span>
+              )}
             </span>
           </div>
           <textarea
@@ -387,8 +395,16 @@ const GeometryCanvas: React.FC = () => {
             spellCheck={false}
             className="flex-grow font-mono text-xs p-3 outline-none resize-none bg-slate-50"
           />
-          {fullParse.errors.length > 0 && (
-            <div className="border-t border-rose-200 bg-rose-50 text-rose-700 text-xs p-2 max-h-32 overflow-y-auto">
+          {(fullParse.errors.length > 0 || (fullParse.infos?.length ?? 0) > 0) && (
+            <div className="border-t border-rose-200 bg-rose-50 text-rose-700 text-xs p-2 max-h-40 overflow-y-auto space-y-1">
+              {(fullParse.infos ?? []).map((msg, i) => (
+                <div
+                  key={`info-${i}`}
+                  className="font-mono text-sky-900 bg-sky-50 border border-sky-200 rounded px-1.5 py-0.5"
+                >
+                  {msg}
+                </div>
+              ))}
               {fullParse.errors.map((e, i) => (
                 <div key={i} className="font-mono">
                   {e}

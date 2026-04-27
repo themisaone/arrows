@@ -10,7 +10,14 @@ import {
   type NestSwapRuleInfo,
   type Point,
 } from "./geometry";
-import { Dot, Figure, Region, type RegionSeg, type Style } from "./shapes";
+import {
+  Dot,
+  Figure,
+  Region,
+  type FigureLayoutCheckpoint,
+  type RegionSeg,
+  type Style,
+} from "./shapes";
 
 /**
  * Tiny text DSL for building a Figure.
@@ -39,6 +46,28 @@ import { Dot, Figure, Region, type RegionSeg, type Style } from "./shapes";
  *   Legacy: if BOTH `tubeHeightLow` and `tubeHeightHigh` are set, `spike`
  *   and the perpendicular part of `perp` use a uniform random distance in
  *   that interval instead of the tubeAverage* / averageSize bands.
+ *   const nestContinuations N         # optional. After each `myShape`, run **N batch
+ *                                      # passes**: pass 1 nests **every** `T*a`/`T*b`
+ *                                      # pair from that shape’s **in** edges; pass 2
+ *                                      # nests **every** pair minted during pass 1; etc.
+ *                                      # Stops early if a pass has no pairs. Within a pass,
+ *                                      # order is the wave queue (e.g. T1 then T2 for
+ *                                      # `out in in`); pairs created in that pass wait for
+ *                                      # the **next** pass (breadth-by-layer, not depth-
+ *                                      # first). Alias: `const continuations`. Default 0.
+ *                                      # Put **before** `myShape` so the limit is known
+ *                                      # when edges emit.
+ *   const nestLayoutMaxAttempts N     # optional. Per inferred `nest` / auto-nest: max
+ *                                      # apex re-picks when the proposed apex lands
+ *                                      # inside an already-filled region (tube/spike area).
+ *                                      # Default **12**. Emits soft {@link ParseResult.infos}
+ *                                      # lines for retries / skipped branches.
+ *   const continuationEndArrow 0|1    # optional. When **1** (default), the **last**
+ *                                      # continuation pass (requires nestContinuations ≥ 2)
+ *                                      # draws the two new sides as **rim-only** arcs
+ *                                      # toward the new centroid — **no** blade, spike,
+ *                                      # or tube tops (an “arrow” tip). Earlier passes stay
+ *                                      # full. Set **0** to keep full tubes on every pass.
  *   point NAME X Y                    # absolute point (draggable)
  *   lerp  NAME FROM TO T              # NAME = FROM + T * (TO - FROM)
  *   arc   FROM TO BEND                # signed bend, no reference
@@ -198,6 +227,8 @@ export type ImplicitNestApexInfo = {
 export interface ParseResult {
   figure: Figure;
   errors: string[];
+  /** Non-fatal notes (e.g. nest apex layout retries). */
+  infos?: string[];
   /** Draggable point names: `point`, `perp`, inferred-apex `nest P1 P2` / `nest P1 P2 REF`. */
   freePoints: string[];
   /** Inferred-apex `nest` lines (3- or 4-token); see {@link updatePointInScript}. */
@@ -324,6 +355,7 @@ export function parse(
   options?: ParseOptions
 ): ParseResult {
   const errors: string[] = [];
+  const infos: string[] = [];
   const freePoints: string[] = [];
   const consts = new Map<string, number>();
   const fig = new Figure();
@@ -418,6 +450,39 @@ export function parse(
   const constOr = (name: keyof typeof BLADE_DEFAULTS): number => {
     if (consts.has(name)) return consts.get(name)!;
     return BLADE_DEFAULTS[name];
+  };
+
+  /**
+   * Max **passes** (batch iterations) of auto-`nest` after each `myShape`; 0 = off.
+   * Reads `nestContinuations` or `continuations`.
+   */
+  const nestContinuationMax = (): number => {
+    if (consts.has("nestContinuations")) {
+      return Math.max(0, Math.floor(consts.get("nestContinuations")!));
+    }
+    if (consts.has("continuations")) {
+      return Math.max(0, Math.floor(consts.get("continuations")!));
+    }
+    return 0;
+  };
+
+  /**
+   * When true, the last auto-continuation pass (if there are ≥2 passes) draws new sides
+   * as rim-only “arrow” tips (no blade/tube). Default on; `const continuationEndArrow 0` disables.
+   */
+  const continuationEndArrow = (): boolean => {
+    if (consts.has("continuationEndArrow")) {
+      return consts.get("continuationEndArrow")! !== 0;
+    }
+    return true;
+  };
+
+  /** Max apex re-picks per inferred `nest` when apex falls inside a filled area. */
+  const nestLayoutMaxAttempts = (): number => {
+    if (consts.has("nestLayoutMaxAttempts")) {
+      return Math.max(1, Math.floor(consts.get("nestLayoutMaxAttempts")!));
+    }
+    return 12;
   };
 
   const parseDir = (raw: string): "in" | "out" => {
@@ -809,6 +874,95 @@ export function parse(
     );
   };
 
+  /** Same geometry as {@link placeNestApexRandomLr} `apply`, without `pushStep` (nest layout retries). */
+  const computeNestApexRandomLrOnFigure = (
+    f: Figure,
+    name: string,
+    p1: string,
+    p2: string,
+    tryIdx: number
+  ) => {
+    const P1 = f.pt(p1);
+    const P2 = f.pt(p2);
+    const dx = P2.x - P1.x;
+    const dy = P2.y - P1.y;
+    const len = Math.hypot(dx, dy) || 1;
+    const ux = dx / len;
+    const uy = dy / len;
+    let nx = -dy / len;
+    let ny = dx / len;
+    const mx = (P1.x + P2.x) / 2;
+    const my = (P1.y + P2.y) / 2;
+    const seedKey =
+      tryIdx === 0
+        ? `${name}|${p1}|${p2}|nestLR`
+        : `${name}|${p1}|${p2}|nestLR|try${tryIdx}`;
+    const rng = mulberry32(seedFor(seedKey));
+    if (rng() < 0.5) {
+      nx = -nx;
+      ny = -ny;
+    }
+    let h: number;
+    if (consts.has("tubeHeightLow") && consts.has("tubeHeightHigh")) {
+      const lo = consts.get("tubeHeightLow")!;
+      const hi = consts.get("tubeHeightHigh")!;
+      h = lo + rng() * (hi - lo);
+    } else {
+      h = spanBand(avgSize(), avgSpanPct(), rng);
+    }
+    const maxPar = (topDispPct() / 100) * avgSize();
+    const t = (2 * rng() - 1) * maxPar;
+    f.point(name, {
+      x: mx + nx * h + ux * t,
+      y: my + ny * h + uy * t,
+    });
+  };
+
+  /** Same geometry as nest `placePerpAwayFrom` `apply`, without `pushStep` (nest layout retries). */
+  const computeNestPerpAwayFromOnFigure = (
+    f: Figure,
+    name: string,
+    p1: string,
+    p2: string,
+    refToken: string,
+    tryIdx: number
+  ) => {
+    const refNm = resolveRefOn(f, refToken);
+    const P1 = f.pt(p1);
+    const P2 = f.pt(p2);
+    const R = f.pt(refNm);
+    const dx = P2.x - P1.x;
+    const dy = P2.y - P1.y;
+    const len = Math.hypot(dx, dy) || 1;
+    const ux = dx / len;
+    const uy = dy / len;
+    let nx = -dy / len;
+    let ny = dx / len;
+    const mx = (P1.x + P2.x) / 2;
+    const my = (P1.y + P2.y) / 2;
+    const towardRef = nx * (R.x - mx) + ny * (R.y - my);
+    if (towardRef > 0) {
+      nx = -nx;
+      ny = -ny;
+    }
+    const seedKey = tryIdx === 0 ? name : `${name}|try${tryIdx}`;
+    const rng = mulberry32(seedFor(seedKey));
+    let h: number;
+    if (consts.has("tubeHeightLow") && consts.has("tubeHeightHigh")) {
+      const lo = consts.get("tubeHeightLow")!;
+      const hi = consts.get("tubeHeightHigh")!;
+      h = lo + rng() * (hi - lo);
+    } else {
+      h = spanBand(avgSize(), avgSpanPct(), rng);
+    }
+    const maxPar = (topDispPct() / 100) * avgSize();
+    const t = (2 * rng() - 1) * maxPar;
+    f.point(name, {
+      x: mx + nx * h + ux * t,
+      y: my + ny * h + uy * t,
+    });
+  };
+
   /** Counter so `myShape` / `nest` can mint unique helper-point names per call. */
   let shapeCounter = 0;
   /**
@@ -841,6 +995,18 @@ export function parse(
       refPointName: string;
     }
   >();
+
+  /**
+   * `T*a`/`T*b` pairs minted on **in** edges (when {@link nestContinuationMax} > 0 at emit time).
+   * After `myShape`, drained into per-pass **waves** for automatic `nest`-equivalent
+   * geometry. While a pass runs, new pairs are routed to the next wave via
+   * {@link continuationAnchorSink}.
+   */
+  const pendingInAnchors: { p1: string; p2: string }[] = [];
+
+  /** When set, `emitShapeEdge` `in`-edge anchor pairs go here instead of `pendingInAnchors`. */
+  let continuationAnchorSink: ((pair: { p1: string; p2: string }) => void) | null =
+    null;
 
   /**
    * `nest` chirality: put blade (`in`) on **p1–p3** when `swap` is true.
@@ -960,6 +1126,12 @@ export function parse(
 
     nextTriCounter += 1;
     const triIdx = nextTriCounter;
+    const triPair = { p1: `T${triIdx}a`, p2: `T${triIdx}b` };
+    if (continuationAnchorSink) {
+      continuationAnchorSink(triPair);
+    } else if (nestContinuationMax() > 0) {
+      pendingInAnchors.push(triPair);
+    }
     pushStep(
       `Next-triangle anchors on tube top ${X}–${Y} (extension k = d/(1−2d) = ${k.toFixed(3)})`,
       [{ from: X, to: Y }],
@@ -982,6 +1154,329 @@ export function parse(
         }
       }
     );
+  };
+
+  const emitNestGeometry = (
+    p1: string,
+    p2: string,
+    p3: string,
+    d13: "in" | "out",
+    d23: "in" | "out",
+    nestUserScriptedMeta:
+      | { d13: "in" | "out"; d23: "in" | "out"; swapped: boolean }
+      | undefined,
+    nestSwapRule: NestSwapRuleInfo,
+    stepNotePrefix: string,
+    /** Rim-only on p1–p3 and p2–p3 (no blade/spike/tube tops); “arrow” ending. */
+    arrowTerminal = false
+  ) => {
+    const id = ++shapeCounter;
+    const big = constOr("bigBend");
+    const hostRef =
+      nestAnchorHostBody.get(p1) ?? nestAnchorHostBody.get(p2);
+    const bodyName = `_ms${id}_body`;
+    const anchorMidName = `_ms${id}_anchorMid`;
+    const apexProjName = `_ms${id}_apexProj`;
+
+    const A = fig.pt(p1);
+    const B = fig.pt(p2);
+    const C = fig.pt(p3);
+
+    const nestSharedBaseOutBend = (f: Figure, refNm: string): number =>
+      resolveSignedBend(f.pt(p1), f.pt(p2), f.pt(refNm), "out", big);
+
+    const midPre = {
+      x: (A.x + B.x) * 0.5,
+      y: (A.y + B.y) * 0.5,
+    };
+    const footPre = footOnLineThrough(A, B, C);
+    const eff13: "in" | "out" = arrowTerminal ? "out" : d13;
+    const eff23: "in" | "out" = arrowTerminal ? "out" : d23;
+    const terminalNote = arrowTerminal
+      ? `\n**Terminal (arrow):** both sides ${p1}–${p3} and ${p2}–${p3} are drawn as **rim-only** (outward arcs toward ${bodyName}) — no blade, spike, or tube tops.\n`
+      : "";
+    pushStep(
+      `${stepNotePrefix}nest (step-through notes): edge modes toward ${p3}${terminalNote}\n${formatNestApexSwapRationale(
+        fig.pt(p1),
+        fig.pt(p2),
+        fig.pt(p3),
+        { a: p1, b: p2, apex: p3 },
+        { d13, d23 },
+        nestUserScriptedMeta,
+        nestSwapRule
+      )}\n` +
+        `Markers: **${anchorMidName}** = midpoint of ${p1}–${p2} (≈ ${midPre.x.toFixed(1)}, ${midPre.y.toFixed(1)}). **${apexProjName}** = projection of ${p3} onto the infinite line ${p1}–${p2} (≈ ${footPre.x.toFixed(1)}, ${footPre.y.toFixed(1)}) — compare to “left/right of midpoint”. ` +
+        (arrowTerminal
+          ? `Each new side is a single rim arc away from ${bodyName} (no inward blade or tube).`
+          : `Later “rim arc … away from ${bodyName}” is the **perimeter bowing away from the new triangle centroid**, not the script token \`out\`/\`in\`; mode **in** adds blade+tube **after** that rim arc.`),
+      [
+        { from: p1, to: p2 },
+        { from: p1, to: p3 },
+        { from: p2, to: p3 },
+      ],
+      (f) => {
+        const Pa = f.pt(p1);
+        const Pb = f.pt(p2);
+        const Pc = f.pt(p3);
+        const mid = { x: (Pa.x + Pb.x) * 0.5, y: (Pa.y + Pb.y) * 0.5 };
+        const foot = footOnLineThrough(Pa, Pb, Pc);
+        f.point(anchorMidName, mid);
+        f.point(apexProjName, foot);
+        macroVis(f, anchorMidName);
+        macroVis(f, apexProjName);
+      }
+    );
+
+    if (hostRef) {
+      pushStep(
+        `nest: shared base outward arc ${p1}–${p2} (prepend — signed bigBend from host ${hostRef}; clipped under host tube fill)`,
+        [{ from: p1, to: p2 }],
+        (f) => {
+          const bOut = nestSharedBaseOutBend(f, hostRef);
+          f.beginShapeBuffer();
+          f.arc(p1, p2, { bend: bOut, style });
+          f.commitShapeBufferPrepend();
+        }
+      );
+    }
+
+    pushStep(
+      `nest: triangle centroid ${bodyName} for (${p1}, ${p2}, ${p3})`,
+      [
+        { from: p1, to: p2 },
+        { from: p2, to: p3 },
+        { from: p3, to: p1 },
+      ],
+      (f) => {
+        f.point(bodyName, {
+          x: (A.x + B.x + C.x) / 3,
+          y: (A.y + B.y + C.y) / 3,
+        });
+        macroVis(f, bodyName);
+      }
+    );
+
+    const dCh = constOr("distance");
+    const k = dCh / (1 - 2 * dCh);
+
+    pushStep(
+      `nest: apex marker (green dot) at ${p3}`,
+      [{ from: p1, to: p3 }],
+      (f) => {
+        if (showMacroHelperLabels) {
+          f.add(new Dot(f.pt(p3), p3, 5, "#16a34a"));
+        }
+      }
+    );
+
+    const edges: Array<[string, string, "in" | "out", string]> = [
+      [p1, p3, eff13, "13"],
+      [p2, p3, eff23, "23"],
+    ];
+    for (const [a, b, mode, suf] of edges) {
+      emitShapeEdge(id, a, b, mode, suf, bodyName, k);
+    }
+
+    if (!hostRef) {
+      pushStep(
+        `nest: shared base outward arc ${p1}–${p2} (signed bigBend out from ${bodyName}; no host ref)`,
+        [{ from: p1, to: p2 }],
+        (f) => {
+          const bOut = nestSharedBaseOutBend(f, bodyName);
+          f.arc(p1, p2, { bend: bOut, style });
+        }
+      );
+    }
+
+    pushStep(
+      `nest: shared base inward arc ${p1}–${p2} (opposite signed bend −bOut vs outward; bigBend scale)`,
+      [{ from: p1, to: p2 }],
+      (f) => {
+        const refNm = hostRef ?? bodyName;
+        const bOut = nestSharedBaseOutBend(f, refNm);
+        f.arc(p1, p2, { bend: -bOut, style });
+      }
+    );
+
+    const tubeSpec =
+      nestAnchorHostTubeReplay.get(p1) ?? nestAnchorHostTubeReplay.get(p2);
+    if (tubeSpec) {
+      pushStep(
+        `nest: repaint host tube — opaque interior then **side+cap arcs on top** (same order as spike/tube so fill does not halve visible stroke width)`,
+        [
+          { from: tubeSpec.p1, to: tubeSpec.q1 },
+          { from: tubeSpec.q1, to: tubeSpec.q2 },
+          { from: tubeSpec.q2, to: tubeSpec.p2 },
+        ],
+        (f) => {
+          const refNm = resolveRefOn(f, tubeSpec.refPointName);
+          emitTubeRegionOnly(
+            f,
+            tubeSpec.p1,
+            tubeSpec.p2,
+            tubeSpec.q1,
+            tubeSpec.q2,
+            tubeSpec.dir,
+            refNm
+          );
+          emitTubeArcP1Q1(
+            f,
+            tubeSpec.p1,
+            tubeSpec.q1,
+            tubeSpec.dir,
+            refNm
+          );
+          emitTubeArcP2Q2(
+            f,
+            tubeSpec.p2,
+            tubeSpec.q2,
+            tubeSpec.dir,
+            refNm
+          );
+          emitTubeCapQ1Q2(
+            f,
+            tubeSpec.q1,
+            tubeSpec.q2,
+            tubeSpec.dir,
+            refNm
+          );
+        }
+      );
+    }
+  };
+
+  type NestTubeReplayEntry = {
+    p1: string;
+    p2: string;
+    q1: string;
+    q2: string;
+    dir: "in" | "out";
+    refPointName: string;
+  };
+
+  type ParseLayoutCheckpoint = {
+    fig: FigureLayoutCheckpoint;
+    buildStepsLen: number;
+    freePointsLen: number;
+    implicitLen: number;
+    shapeCounterSnap: number;
+    nextTriSnap: number;
+    nestHost: Map<string, string>;
+    nestTube: Map<string, NestTubeReplayEntry>;
+    nextWaveLen: number;
+  };
+
+  const saveParseCheckpoint = (
+    nextWave: { p1: string; p2: string }[]
+  ): ParseLayoutCheckpoint => ({
+    fig: fig.layoutCheckpoint(),
+    buildStepsLen: buildSteps.length,
+    freePointsLen: freePoints.length,
+    implicitLen: implicitNestApexes.length,
+    shapeCounterSnap: shapeCounter,
+    nextTriSnap: nextTriCounter,
+    nestHost: new Map(nestAnchorHostBody),
+    nestTube: new Map(
+      Array.from(nestAnchorHostTubeReplay.entries()).map(([k, v]) => [
+        k,
+        { ...v },
+      ])
+    ),
+    nextWaveLen: nextWave.length,
+  });
+
+  const restoreParseCheckpoint = (
+    c: ParseLayoutCheckpoint,
+    nextWave: { p1: string; p2: string }[]
+  ) => {
+    fig.restoreLayoutCheckpoint(c.fig);
+    buildSteps.length = c.buildStepsLen;
+    freePoints.length = c.freePointsLen;
+    implicitNestApexes.length = c.implicitLen;
+    shapeCounter = c.shapeCounterSnap;
+    nextTriCounter = c.nextTriSnap;
+    nestAnchorHostBody.clear();
+    for (const [k, v] of c.nestHost) nestAnchorHostBody.set(k, v);
+    nestAnchorHostTubeReplay.clear();
+    for (const [k, v] of c.nestTube) nestAnchorHostTubeReplay.set(k, v);
+    nextWave.length = c.nextWaveLen;
+  };
+
+  /**
+   * Inferred-apex nest retries: if the proposed apex is inside an already-filled
+   * region (tube/spike interior), restore and re-pick. On exhaustion, skip this branch.
+   */
+  const runNestWithApexLayoutRetries = (opts: {
+    p1: string;
+    p2: string;
+    p3: string;
+    nextWave: { p1: string; p2: string }[] | null;
+    placeApexSilent: (tryIdx: number) => void;
+    implicitPush?: (d13: "in" | "out", d23: "in" | "out") => void;
+    nestUserScriptedMeta:
+      | { d13: "in" | "out"; d23: "in" | "out"; swapped: boolean }
+      | undefined;
+    /** When set (e.g. eight-token `nest`), rebuild meta after each apex from swap result. */
+    nestUserScriptedMetaFn?: (r: {
+      swap: boolean;
+      swapRule: NestSwapRuleInfo;
+    }) => { d13: "in" | "out"; d23: "in" | "out"; swapped: boolean };
+    stepNotePrefix: string;
+    arrowTerminal: boolean;
+    label: string;
+    /** When false (e.g. eight-token `nest`), do not register apex in `freePoints`. Default true. */
+    trackFreePointApex?: boolean;
+  }) => {
+    const maxT = stepped ? 1 : nestLayoutMaxAttempts();
+    const wave = opts.nextWave ?? [];
+    const cp = saveParseCheckpoint(wave);
+    const trackFp = opts.trackFreePointApex !== false;
+    for (let k = 0; k < maxT; k++) {
+      restoreParseCheckpoint(cp, wave);
+      opts.placeApexSilent(k);
+      const apex = fig.pt(opts.p3);
+      if (fig.isPointInsideAnyFilledRegion(apex)) {
+        if (k < maxT - 1) {
+          infos.push(
+            `${opts.label}: RETRY ${k + 2}/${maxT} — apex ${opts.p3} falls inside an existing filled area.`
+          );
+          continue;
+        }
+        infos.push(
+          `${opts.label}: apex remained inside filled areas after ${maxT} tries — branch skipped.`
+        );
+        restoreParseCheckpoint(cp, wave);
+        return;
+      }
+      if (trackFp) freePoints.push(opts.p3);
+      let d13: "in" | "out" = "out";
+      let d23: "in" | "out" = "in";
+      const r = resolveNestSideSwap(opts.p1, opts.p2, opts.p3, fig);
+      const nestSwapRule = r.swapRule;
+      if (r.swap) {
+        d13 = "in";
+        d23 = "out";
+      }
+      const meta =
+        opts.nestUserScriptedMetaFn?.(r) ?? opts.nestUserScriptedMeta;
+      emitNestGeometry(
+        opts.p1,
+        opts.p2,
+        opts.p3,
+        d13,
+        d23,
+        meta,
+        nestSwapRule,
+        opts.stepNotePrefix,
+        opts.arrowTerminal
+      );
+      infos.push(
+        `${opts.label}: apex accepted on attempt ${k + 1}/${maxT}.`
+      );
+      opts.implicitPush?.(d13, d23);
+      return;
+    }
+    restoreParseCheckpoint(cp, wave);
   };
 
   for (let i = 0; i < scriptLines.length; i++) {
@@ -1209,6 +1704,95 @@ export function parse(
           for (const [a, b, mode, suf] of edges) {
             emitShapeEdge(id, a, b, mode, suf, bodyName, k);
           }
+
+          const passMax = nestContinuationMax();
+          if (passMax > 0) {
+            let wave = pendingInAnchors.splice(0, pendingInAnchors.length);
+            for (let pass = 0; pass < passMax && wave.length > 0; pass++) {
+              const nextWave: { p1: string; p2: string }[] = [];
+              continuationAnchorSink = (pair) => {
+                nextWave.push(pair);
+              };
+              try {
+                for (let wi = 0; wi < wave.length; wi++) {
+                  const { p1: na, p2: nb } = wave[wi]!;
+                  const inferredA = inferNestApexFromAnchors(na, nb);
+                  if (!inferredA) continue;
+                  const p3a = inferredA;
+                  const hostBody =
+                    nestAnchorHostBody.get(na) ?? nestAnchorHostBody.get(nb);
+                  const arrowTerminal =
+                    continuationEndArrow() &&
+                    passMax > 1 &&
+                    pass === passMax - 1;
+                  const stepPf = `[auto nest pass ${pass + 1}/${passMax}, pair ${wi + 1}/${wave.length}] `;
+                  if (!stepped) {
+                    runNestWithApexLayoutRetries({
+                      p1: na,
+                      p2: nb,
+                      p3: p3a,
+                      nextWave,
+                      placeApexSilent: (tryIdx) => {
+                        if (hostBody) {
+                          computeNestPerpAwayFromOnFigure(
+                            fig,
+                            p3a,
+                            na,
+                            nb,
+                            hostBody,
+                            tryIdx
+                          );
+                        } else {
+                          computeNestApexRandomLrOnFigure(
+                            fig,
+                            p3a,
+                            na,
+                            nb,
+                            tryIdx
+                          );
+                        }
+                      },
+                      nestUserScriptedMeta: undefined,
+                      stepNotePrefix: stepPf,
+                      arrowTerminal,
+                      label: `Auto nest ${na}–${nb}`,
+                    });
+                  } else {
+                    if (hostBody) {
+                      placePerpAwayFrom(p3a, na, nb, hostBody, "nest");
+                    } else {
+                      placeNestApexRandomLr(p3a, na, nb);
+                    }
+                    freePoints.push(p3a);
+                    let da13: "in" | "out" = "out";
+                    let da23: "in" | "out" = "in";
+                    const rAuto = resolveNestSideSwap(na, nb, p3a, fig);
+                    const swapRuleAuto = rAuto.swapRule;
+                    if (rAuto.swap) {
+                      da13 = "in";
+                      da23 = "out";
+                    }
+                    emitNestGeometry(
+                      na,
+                      nb,
+                      p3a,
+                      da13,
+                      da23,
+                      undefined,
+                      swapRuleAuto,
+                      stepPf,
+                      arrowTerminal
+                    );
+                  }
+                }
+              } finally {
+                continuationAnchorSink = null;
+              }
+              wave = nextWave;
+            }
+          } else {
+            pendingInAnchors.length = 0;
+          }
           break;
         }
 
@@ -1233,8 +1817,8 @@ export function parse(
           let p1: string;
           let p2: string;
           let p3: string;
-          let d13: "in" | "out";
-          let d23: "in" | "out";
+          let d13: "in" | "out" = "out";
+          let d23: "in" | "out" = "out";
           let nestUserScriptedMeta:
             | { d13: "in" | "out"; d23: "in" | "out"; swapped: boolean }
             | undefined;
@@ -1242,6 +1826,7 @@ export function parse(
             kind: "dotFallback",
             dotFallback: 0,
           };
+          let nestEmitDone = false;
 
           if (tokens.length === 3) {
             [, p1, p2] = tokens;
@@ -1256,28 +1841,66 @@ export function parse(
             p3 = inferred;
             const hostBody =
               nestAnchorHostBody.get(p1) ?? nestAnchorHostBody.get(p2);
-            if (hostBody) {
-              placePerpAwayFrom(p3, p1, p2, hostBody, "nest");
+            if (!stepped) {
+              runNestWithApexLayoutRetries({
+                p1,
+                p2,
+                p3,
+                nextWave: null,
+                placeApexSilent: (tryIdx) => {
+                  if (hostBody) {
+                    computeNestPerpAwayFromOnFigure(
+                      fig,
+                      p3,
+                      p1,
+                      p2,
+                      hostBody,
+                      tryIdx
+                    );
+                  } else {
+                    computeNestApexRandomLrOnFigure(fig, p3, p1, p2, tryIdx);
+                  }
+                },
+                implicitPush: (d13r, d23r) => {
+                  implicitNestApexes.push({
+                    apex: p3,
+                    p1,
+                    p2,
+                    d13: d13r,
+                    d23: d23r,
+                    lineNum: scriptLineNum,
+                  });
+                },
+                nestUserScriptedMeta: undefined,
+                stepNotePrefix: "",
+                arrowTerminal: false,
+                label: `nest ${p1} ${p2}→${p3}`,
+              });
+              nestEmitDone = true;
             } else {
-              placeNestApexRandomLr(p3, p1, p2);
+              if (hostBody) {
+                placePerpAwayFrom(p3, p1, p2, hostBody, "nest");
+              } else {
+                placeNestApexRandomLr(p3, p1, p2);
+              }
+              freePoints.push(p3);
+              d13 = "out";
+              d23 = "in";
+              const r3 = resolveNestSideSwap(p1, p2, p3, fig);
+              nestSwapRule = r3.swapRule;
+              if (r3.swap) {
+                d13 = "in";
+                d23 = "out";
+              }
+              implicitNestApexes.push({
+                apex: p3,
+                p1,
+                p2,
+                d13,
+                d23,
+                lineNum: scriptLineNum,
+              });
             }
-            freePoints.push(p3);
-            d13 = "out";
-            d23 = "in";
-            const r3 = resolveNestSideSwap(p1, p2, p3, fig);
-            nestSwapRule = r3.swapRule;
-            if (r3.swap) {
-              d13 = "in";
-              d23 = "out";
-            }
-            implicitNestApexes.push({
-              apex: p3,
-              p1,
-              p2,
-              d13,
-              d23,
-              lineNum: scriptLineNum,
-            });
           } else if (tokens.length === 4) {
             let refTok: string;
             [, p1, p2, refTok] = tokens;
@@ -1289,25 +1912,60 @@ export function parse(
               );
             }
             p3 = inferred;
-            placePerpAwayFrom(p3, p1, p2, refTok, "nest");
-            freePoints.push(p3);
-            d13 = "out";
-            d23 = "in";
-            const r4 = resolveNestSideSwap(p1, p2, p3, fig);
-            nestSwapRule = r4.swapRule;
-            if (r4.swap) {
-              d13 = "in";
-              d23 = "out";
+            if (!stepped) {
+              runNestWithApexLayoutRetries({
+                p1,
+                p2,
+                p3,
+                nextWave: null,
+                placeApexSilent: (tryIdx) => {
+                  computeNestPerpAwayFromOnFigure(
+                    fig,
+                    p3,
+                    p1,
+                    p2,
+                    refTok,
+                    tryIdx
+                  );
+                },
+                implicitPush: (d13r, d23r) => {
+                  implicitNestApexes.push({
+                    apex: p3,
+                    p1,
+                    p2,
+                    awayRef: refTok,
+                    d13: d13r,
+                    d23: d23r,
+                    lineNum: scriptLineNum,
+                  });
+                },
+                nestUserScriptedMeta: undefined,
+                stepNotePrefix: "",
+                arrowTerminal: false,
+                label: `nest ${p1} ${p2} ${refTok}→${p3}`,
+              });
+              nestEmitDone = true;
+            } else {
+              placePerpAwayFrom(p3, p1, p2, refTok, "nest");
+              freePoints.push(p3);
+              d13 = "out";
+              d23 = "in";
+              const r4 = resolveNestSideSwap(p1, p2, p3, fig);
+              nestSwapRule = r4.swapRule;
+              if (r4.swap) {
+                d13 = "in";
+                d23 = "out";
+              }
+              implicitNestApexes.push({
+                apex: p3,
+                p1,
+                p2,
+                awayRef: refTok,
+                d13,
+                d23,
+                lineNum: scriptLineNum,
+              });
             }
-            implicitNestApexes.push({
-              apex: p3,
-              p1,
-              p2,
-              awayRef: refTok,
-              d13,
-              d23,
-              lineNum: scriptLineNum,
-            });
           } else if (tokens.length === 6) {
             let d13Raw: string;
             let d23Raw: string;
@@ -1343,23 +2001,53 @@ export function parse(
             let d23Raw: string;
             let refTok: string;
             [, p1, p2, p3, , refTok, d13Raw, d23Raw] = tokens;
-            placePerpAwayFrom(p3, p1, p2, refTok, "nest");
             const u13b = parseDir(d13Raw);
             const u23b = parseDir(d23Raw);
-            d13 = u13b;
-            d23 = u23b;
-            const r8 = resolveNestSideSwap(p1, p2, p3, fig);
-            nestSwapRule = r8.swapRule;
-            if (r8.swap) {
-              const t = d13;
-              d13 = d23;
-              d23 = t;
+            if (!stepped) {
+              runNestWithApexLayoutRetries({
+                p1,
+                p2,
+                p3,
+                nextWave: null,
+                placeApexSilent: (tryIdx) => {
+                  computeNestPerpAwayFromOnFigure(
+                    fig,
+                    p3,
+                    p1,
+                    p2,
+                    refTok,
+                    tryIdx
+                  );
+                },
+                nestUserScriptedMetaFn: (r) => ({
+                  d13: u13b,
+                  d23: u23b,
+                  swapped: r.swap,
+                }),
+                nestUserScriptedMeta: undefined,
+                stepNotePrefix: "",
+                arrowTerminal: false,
+                label: `nest ${p1} ${p2} ${p3} awayFrom ${refTok}`,
+                trackFreePointApex: false,
+              });
+              nestEmitDone = true;
+            } else {
+              placePerpAwayFrom(p3, p1, p2, refTok, "nest");
+              d13 = u13b;
+              d23 = u23b;
+              const r8 = resolveNestSideSwap(p1, p2, p3, fig);
+              nestSwapRule = r8.swapRule;
+              if (r8.swap) {
+                const t = d13;
+                d13 = d23;
+                d23 = t;
+              }
+              nestUserScriptedMeta = {
+                d13: u13b,
+                d23: u23b,
+                swapped: r8.swap,
+              };
             }
-            nestUserScriptedMeta = {
-              d13: u13b,
-              d23: u23b,
-              swapped: r8.swap,
-            };
           } else {
             throw new Error(
               "usage: nest P1 P2  |  nest P1 P2 REF  |  nest P1 P2 P3 in|out in|out  |  " +
@@ -1367,183 +2055,19 @@ export function parse(
             );
           }
 
-          const id = ++shapeCounter;
-          const big = constOr("bigBend");
-          const hostRef =
-            nestAnchorHostBody.get(p1) ?? nestAnchorHostBody.get(p2);
-          const bodyName = `_ms${id}_body`;
-          const anchorMidName = `_ms${id}_anchorMid`;
-          const apexProjName = `_ms${id}_apexProj`;
-
-          // New triangle's body = centroid of P1, P2, P3 (used below).
-          const A = fig.pt(p1);
-          const B = fig.pt(p2);
-          const C = fig.pt(p3);
-
-          /**
-           * Signed bigBend for chord p1–p2 “outward” from `refNm` (host `_ms…_body`
-           * when nesting on T*a/T*b). The inward mate is always **-bOut** so the two
-           * quadratics stay on opposite sides of the chord — using dir=in with a
-           * *different* ref can accidentally yield the same signed bend as dir=out.
-           */
-          const nestSharedBaseOutBend = (f: Figure, refNm: string): number =>
-            resolveSignedBend(f.pt(p1), f.pt(p2), f.pt(refNm), "out", big);
-
-          const midPre = {
-            x: (A.x + B.x) * 0.5,
-            y: (A.y + B.y) * 0.5,
-          };
-          const footPre = footOnLineThrough(A, B, C);
-          pushStep(
-            `nest (step-through notes): edge modes toward ${p3}\n${formatNestApexSwapRationale(
-              fig.pt(p1),
-              fig.pt(p2),
-              fig.pt(p3),
-              { a: p1, b: p2, apex: p3 },
-              { d13, d23 },
+          if (!nestEmitDone) {
+            emitNestGeometry(
+              p1,
+              p2,
+              p3,
+              d13,
+              d23,
               nestUserScriptedMeta,
-              nestSwapRule
-            )}\n` +
-              `Markers: **${anchorMidName}** = midpoint of ${p1}–${p2} (≈ ${midPre.x.toFixed(1)}, ${midPre.y.toFixed(1)}). **${apexProjName}** = projection of ${p3} onto the infinite line ${p1}–${p2} (≈ ${footPre.x.toFixed(1)}, ${footPre.y.toFixed(1)}) — compare to “left/right of midpoint”. ` +
-              `Later “rim arc … away from ${bodyName}” is the **perimeter bowing away from the new triangle centroid**, not the script token \`out\`/\`in\`; mode **in** adds blade+tube **after** that rim arc.`,
-            [
-              { from: p1, to: p2 },
-              { from: p1, to: p3 },
-              { from: p2, to: p3 },
-            ],
-            (f) => {
-              const Pa = f.pt(p1);
-              const Pb = f.pt(p2);
-              const Pc = f.pt(p3);
-              const mid = { x: (Pa.x + Pb.x) * 0.5, y: (Pa.y + Pb.y) * 0.5 };
-              const foot = footOnLineThrough(Pa, Pb, Pc);
-              f.point(anchorMidName, mid);
-              f.point(apexProjName, foot);
-              macroVis(f, anchorMidName);
-              macroVis(f, apexProjName);
-            }
-          );
-
-          // Outward arc under the rest of the figure: host opaque tube then hides it
-          // where paths overlap (same idea as the clipped middle of an `in` edge).
-          if (hostRef) {
-            pushStep(
-              `nest: shared base outward arc ${p1}–${p2} (prepend — signed bigBend from host ${hostRef}; clipped under host tube fill)`,
-              [{ from: p1, to: p2 }],
-              (f) => {
-                const bOut = nestSharedBaseOutBend(f, hostRef);
-                f.beginShapeBuffer();
-                f.arc(p1, p2, { bend: bOut, style });
-                f.commitShapeBufferPrepend();
-              }
+              nestSwapRule,
+              "",
+              false
             );
           }
-
-          pushStep(
-            `nest: triangle centroid ${bodyName} for (${p1}, ${p2}, ${p3})`,
-            [
-              { from: p1, to: p2 },
-              { from: p2, to: p3 },
-              { from: p3, to: p1 },
-            ],
-            (f) => {
-              f.point(bodyName, {
-                x: (A.x + B.x + C.x) / 3,
-                y: (A.y + B.y + C.y) / 3,
-              });
-              macroVis(f, bodyName);
-            }
-          );
-
-          const dCh = constOr("distance");
-          const k = dCh / (1 - 2 * dCh);
-
-          pushStep(
-            `nest: apex marker (green dot) at ${p3}`,
-            [{ from: p1, to: p3 }],
-            (f) => {
-              if (showMacroHelperLabels) {
-                f.add(new Dot(f.pt(p3), p3, 5, "#16a34a"));
-              }
-            }
-          );
-
-          const edges: Array<[string, string, "in" | "out", string]> = [
-            [p1, p3, d13, "13"],
-            [p2, p3, d23, "23"],
-          ];
-          for (const [a, b, mode, suf] of edges) {
-            emitShapeEdge(id, a, b, mode, suf, bodyName, k);
-          }
-
-          if (!hostRef) {
-            pushStep(
-              `nest: shared base outward arc ${p1}–${p2} (signed bigBend out from ${bodyName}; no host ref)`,
-              [{ from: p1, to: p2 }],
-              (f) => {
-                const bOut = nestSharedBaseOutBend(f, bodyName);
-                f.arc(p1, p2, { bend: bOut, style });
-              }
-            );
-          }
-
-          pushStep(
-            `nest: shared base inward arc ${p1}–${p2} (opposite signed bend −bOut vs outward; bigBend scale)`,
-            [{ from: p1, to: p2 }],
-            (f) => {
-              const refNm = hostRef ?? bodyName;
-              const bOut = nestSharedBaseOutBend(f, refNm);
-              f.arc(p1, p2, { bend: -bOut, style });
-            }
-          );
-
-          const tubeSpec =
-            nestAnchorHostTubeReplay.get(p1) ??
-            nestAnchorHostTubeReplay.get(p2);
-          if (tubeSpec) {
-            pushStep(
-              `nest: repaint host tube — opaque interior then **side+cap arcs on top** (same order as spike/tube so fill does not halve visible stroke width)`,
-              [
-                { from: tubeSpec.p1, to: tubeSpec.q1 },
-                { from: tubeSpec.q1, to: tubeSpec.q2 },
-                { from: tubeSpec.q2, to: tubeSpec.p2 },
-              ],
-              (f) => {
-                const refNm = resolveRefOn(f, tubeSpec.refPointName);
-                emitTubeRegionOnly(
-                  f,
-                  tubeSpec.p1,
-                  tubeSpec.p2,
-                  tubeSpec.q1,
-                  tubeSpec.q2,
-                  tubeSpec.dir,
-                  refNm
-                );
-                emitTubeArcP1Q1(
-                  f,
-                  tubeSpec.p1,
-                  tubeSpec.q1,
-                  tubeSpec.dir,
-                  refNm
-                );
-                emitTubeArcP2Q2(
-                  f,
-                  tubeSpec.p2,
-                  tubeSpec.q2,
-                  tubeSpec.dir,
-                  refNm
-                );
-                emitTubeCapQ1Q2(
-                  f,
-                  tubeSpec.q1,
-                  tubeSpec.q2,
-                  tubeSpec.dir,
-                  refNm
-                );
-              }
-            );
-          }
-
           break;
         }
 
@@ -1613,6 +2137,7 @@ export function parse(
   return {
     figure: fig,
     errors,
+    infos: infos.length > 0 ? infos : undefined,
     freePoints: stepped ? scanFreePointNamesFromScript(script) : freePoints,
     implicitNestApexes,
     buildSteps: stepped ? buildSteps : undefined,

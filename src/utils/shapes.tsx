@@ -318,34 +318,24 @@ export class Blade implements Shape {
     });
   }
 
-  render(key: string = nextKey()): ReactNode {
+  /** Geometry used for drawing and for {@link Figure.collectStrokeLayoutSamples} (no label dots). */
+  getStrokeSubshapes(): Shape[] {
     const { outerBend, innerBend, t1, t2, style, tubeLegBend } = this.opts;
-
     const Pouter = perpControl(this.p1, this.p2, outerBend);
-
-    // F, G are on the STRAIGHT chord; X, Y on the outer arc directly above them
-    // (because perpControl puts the control on the perpendicular bisector,
-    //  Bezier parameter t lines up with chord position t).
     const F = lerp(this.p1, this.p2, t1);
     const G = lerp(this.p1, this.p2, t2);
     const X = quadAt(this.p1, Pouter, this.p2, t1);
     const Y = quadAt(this.p1, Pouter, this.p2, t2);
-
-    // Visible halves of the outer arc: p1 -> X and Y -> p2.
-    // (The X -> Y middle is "clipped" by the tube and intentionally not drawn.)
     const left = quadSubSegment(this.p1, Pouter, this.p2, 0, t1);
     const right = quadSubSegment(this.p1, Pouter, this.p2, t2, 1);
-
     const Pinner = perpControl(F, G, innerBend);
-
     const legBendMag =
       tubeLegBend != null && Math.abs(tubeLegBend) > 1e-12
         ? Math.abs(tubeLegBend)
         : 0;
-
     const parts: Shape[] = [
-      new QuadBezier(left[0], left[1], left[2], style),       // outer arc, p1 -> X
-      new QuadBezier(right[0], right[1], right[2], style),    // outer arc, Y -> p2
+      new QuadBezier(left[0], left[1], left[2], style),
+      new QuadBezier(right[0], right[1], right[2], style),
     ];
     if (legBendMag !== 0) {
       const bFX = signTowards(F, X, Pouter) * legBendMag;
@@ -356,7 +346,19 @@ export class Blade implements Shape {
       parts.push(new LineSeg(F, X, style));
       parts.push(new LineSeg(G, Y, style));
     }
-    parts.push(new QuadBezier(F, Pinner, G, style)); // inwards arc F -> G
+    parts.push(new QuadBezier(F, Pinner, G, style));
+    return parts;
+  }
+
+  render(key: string = nextKey()): ReactNode {
+    const { outerBend, t1, t2 } = this.opts;
+    const Pouter = perpControl(this.p1, this.p2, outerBend);
+    const F = lerp(this.p1, this.p2, t1);
+    const G = lerp(this.p1, this.p2, t2);
+    const X = quadAt(this.p1, Pouter, this.p2, t1);
+    const Y = quadAt(this.p1, Pouter, this.p2, t2);
+
+    const parts: Shape[] = [...this.getStrokeSubshapes()];
 
     if (this.opts.showLabels) {
       const [lF, lG] = this.opts.innerLabels ?? ["F", "G"];
@@ -428,6 +430,13 @@ export interface ArcOptions {
   style?: Style;
 }
 
+/** Snapshot for {@link Figure.restoreLayoutCheckpoint} (parser nest layout retries). */
+export type FigureLayoutCheckpoint = {
+  points: Map<string, Point>;
+  shapeCount: number;
+  shapeBuffer: Shape[] | null;
+};
+
 export class Figure implements Shape {
   private points = new Map<string, Point>();
   private shapes: Shape[] = [];
@@ -493,6 +502,33 @@ export class Figure implements Shape {
     return this;
   }
 
+  /** Copy point map and truncate drawable lists (used to roll back a failed `nest`). */
+  layoutCheckpoint(): FigureLayoutCheckpoint {
+    const pts = new Map<string, Point>();
+    for (const [k, v] of this.points) {
+      pts.set(k, { x: v.x, y: v.y });
+    }
+    return {
+      points: pts,
+      shapeCount: this.shapes.length,
+      shapeBuffer:
+        this.shapeBuffer === null ? null : [...this.shapeBuffer],
+    };
+  }
+
+  restoreLayoutCheckpoint(c: FigureLayoutCheckpoint): void {
+    this.points = new Map();
+    for (const [k, v] of c.points) {
+      this.points.set(k, { x: v.x, y: v.y });
+    }
+    this.shapes.length = c.shapeCount;
+    if (c.shapeBuffer === null) {
+      this.shapeBuffer = null;
+    } else {
+      this.shapeBuffer = [...c.shapeBuffer];
+    }
+  }
+
   /** Draw an arc between two named points. */
   arc(from: string, to: string, opts: ArcOptions): this {
     const p1 = this.pt(from);
@@ -554,6 +590,128 @@ export class Figure implements Shape {
   /** Get the underlying group (e.g. to nest under a transform). */
   build(): Group {
     return new Group(this.shapes);
+  }
+
+  /**
+   * Dense samples along drawable strokes (arcs, lines, region outlines) for
+   * approximate geometric checks (e.g. clearance of auto-placed free points).
+   */
+  collectStrokeLayoutSamples(samplesPerQuad: number = 14): Point[] {
+    const out: Point[] = [];
+    const n = Math.max(4, Math.floor(samplesPerQuad));
+    const sampleQuad = (p0: Point, p1: Point, p2: Point) => {
+      for (let i = 0; i <= n; i++) {
+        const t = i / n;
+        out.push(quadAt(p0, p1, p2, t));
+      }
+    };
+    const walkRegionBoundary = (region: Region) => {
+      let cur = region.start;
+      out.push(cur);
+      for (const seg of region.segments) {
+        if (seg.kind === "line") {
+          for (let i = 1; i <= n; i++) {
+            const t = i / n;
+            out.push({
+              x: cur.x + (seg.to.x - cur.x) * t,
+              y: cur.y + (seg.to.y - cur.y) * t,
+            });
+          }
+          cur = seg.to;
+        } else {
+          for (let i = 1; i <= n; i++) {
+            const t = i / n;
+            out.push(quadAt(cur, seg.ctrl, seg.to, t));
+          }
+          cur = seg.to;
+        }
+      }
+    };
+    const walk = (shape: Shape) => {
+      if (shape instanceof LineSeg) {
+        out.push(shape.p1, shape.p2);
+        out.push(lerp(shape.p1, shape.p2, 0.5));
+      } else if (shape instanceof ArcSeg) {
+        const c = perpControl(shape.p1, shape.p2, shape.bend);
+        sampleQuad(shape.p1, c, shape.p2);
+      } else if (shape instanceof QuadBezier) {
+        sampleQuad(shape.p0, shape.p1, shape.p2);
+      } else if (shape instanceof Region) {
+        walkRegionBoundary(shape);
+      } else if (shape instanceof Group) {
+        for (const c of shape.children) walk(c);
+      } else if (shape instanceof Blade) {
+        for (const c of shape.getStrokeSubshapes()) walk(c);
+      }
+      // Dot: skip (labels / markers — not stroke clearance targets)
+    };
+    for (const s of this.shapes) walk(s);
+    return out;
+  }
+
+  /**
+   * Approximate containment check against already painted filled regions
+   * (currently `Region`, used by tube/spike interiors).
+   */
+  isPointInsideAnyFilledRegion(p: Point, quadSamples = 18): boolean {
+    const n = Math.max(6, Math.floor(quadSamples));
+    const pointInPolygon = (q: Point, poly: Point[]): boolean => {
+      if (poly.length < 3) return false;
+      let inside = false;
+      for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+        const a = poly[i]!;
+        const b = poly[j]!;
+        const intersects =
+          a.y > q.y !== b.y > q.y &&
+          q.x < ((b.x - a.x) * (q.y - a.y)) / ((b.y - a.y) || 1e-12) + a.x;
+        if (intersects) inside = !inside;
+      }
+      return inside;
+    };
+    const regionPolygon = (r: Region): Point[] => {
+      const out: Point[] = [];
+      let cur = r.start;
+      out.push(cur);
+      for (const seg of r.segments) {
+        if (seg.kind === "line") {
+          for (let i = 1; i <= n; i++) {
+            const t = i / n;
+            out.push({
+              x: cur.x + (seg.to.x - cur.x) * t,
+              y: cur.y + (seg.to.y - cur.y) * t,
+            });
+          }
+          cur = seg.to;
+        } else {
+          for (let i = 1; i <= n; i++) {
+            const t = i / n;
+            out.push(quadAt(cur, seg.ctrl, seg.to, t));
+          }
+          cur = seg.to;
+        }
+      }
+      return out;
+    };
+    const walk = (shape: Shape): boolean => {
+      if (shape instanceof Region) {
+        return pointInPolygon(p, regionPolygon(shape));
+      }
+      if (shape instanceof Group) {
+        for (const c of shape.children) {
+          if (walk(c)) return true;
+        }
+      }
+      if (shape instanceof Blade) {
+        for (const c of shape.getStrokeSubshapes()) {
+          if (walk(c)) return true;
+        }
+      }
+      return false;
+    };
+    for (const s of this.shapes) {
+      if (walk(s)) return true;
+    }
+    return false;
   }
 
   render(key: string = nextKey()): ReactNode {

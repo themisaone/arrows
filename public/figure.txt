@@ -25,21 +25,19 @@ const smallBend      0.16
 const tubeBend       0.06
 const distance       0.20
 
+# Nest apex / auto-nest: re-pick apex when an apex lands inside an already filled area.
+const nestLayoutMaxAttempts 8
+
+# After each `myShape`, N batch passes: each pass nests every open T*a/T*b pair from the previous wave.
+const nestContinuations 3
+# Last pass (when N≥2): rim-only “arrow” tips — no blade/tube. `const continuationEndArrow 0` keeps full tubes on every pass.
+
 # Compact layout for nesting several shapes on one page
 point A 400 300
 point B 380 420
 point C 520 380
 
 myShape A B C out in in
-
-# nest T*a T*b: infers …c; apex ⊥ away from that tube edge's triangle body (opening)
-nest T1a T1b
-
-nest T2a T2b
-nest T3a T3b
-nest T4a T4b
-nest T5a T5b
-nest T6a T6b
 
 dot A B C
 
