@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import type { CSSProperties, ReactNode } from "react";
 import {
   lerp,
   perpControl,
@@ -51,6 +51,13 @@ const merged = (s?: Style): Required<Style> => ({ ...defaultStyle, ...s });
 
 let _autoKey = 0;
 const nextKey = () => `s${_autoKey++}`;
+let _drawOrder = 0;
+const nextDrawOrder = () => _drawOrder++;
+
+export function resetShapeRenderCounters(): void {
+  _autoKey = 0;
+  _drawOrder = 0;
+}
 
 export interface Shape {
   /** Render the shape as an SVG fragment. `key` is supplied by the parent. */
@@ -77,10 +84,15 @@ export class QuadBezier implements Shape {
 
   render(key: string = nextKey()): ReactNode {
     const s = merged(this.style);
+    const drawOrder = nextDrawOrder();
+    const drawStyle = { "--draw-order": drawOrder } as CSSProperties;
     return (
       <path
         key={key}
         d={quadPath(this.p0, this.p1, this.p2)}
+        pathLength={1}
+        className="draw-stroke"
+        style={drawStyle}
         fill={s.fill}
         stroke={s.stroke}
         strokeWidth={s.strokeWidth}
@@ -135,6 +147,8 @@ export class LineSeg implements Shape {
 
   render(key: string = nextKey()): ReactNode {
     const s = merged(this.style);
+    const drawOrder = nextDrawOrder();
+    const drawStyle = { "--draw-order": drawOrder } as CSSProperties;
     return (
       <line
         key={key}
@@ -142,6 +156,9 @@ export class LineSeg implements Shape {
         y1={this.p1.y}
         x2={this.p2.x}
         y2={this.p2.y}
+        pathLength={1}
+        className="draw-stroke"
+        style={drawStyle}
         stroke={s.stroke}
         strokeWidth={s.strokeWidth}
         strokeLinecap={s.linecap}
@@ -211,6 +228,8 @@ export class Region implements Shape {
   }
 
   render(key: string = nextKey()): ReactNode {
+    const drawOrder = nextDrawOrder();
+    const drawStyle = { "--draw-order": drawOrder } as CSSProperties;
     const parts: string[] = [`M ${this.start.x} ${this.start.y}`];
     for (const s of this.segments) {
       if (s.kind === "line") {
@@ -221,7 +240,14 @@ export class Region implements Shape {
     }
     parts.push("Z");
     return (
-      <path key={key} d={parts.join(" ")} fill={this.fill} stroke="none" />
+      <path
+        key={key}
+        d={parts.join(" ")}
+        className="draw-fill"
+        style={drawStyle}
+        fill={this.fill}
+        stroke="none"
+      />
     );
   }
 }
@@ -472,6 +498,26 @@ export class Figure implements Shape {
   /** Whether a point with this name has been defined. */
   has(name: string): boolean {
     return this.points.has(name);
+  }
+
+  /** Bounds of all named points currently in the figure, or null when empty. */
+  bounds():
+    | { minX: number; minY: number; maxX: number; maxY: number }
+    | null {
+    const vals = Array.from(this.points.values());
+    if (vals.length === 0) return null;
+    let minX = vals[0]!.x;
+    let minY = vals[0]!.y;
+    let maxX = vals[0]!.x;
+    let maxY = vals[0]!.y;
+    for (let i = 1; i < vals.length; i++) {
+      const p = vals[i]!;
+      if (p.x < minX) minX = p.x;
+      if (p.y < minY) minY = p.y;
+      if (p.x > maxX) maxX = p.x;
+      if (p.y > maxY) maxY = p.y;
+    }
+    return { minX, minY, maxX, maxY };
   }
 
   private enqueueShape(shape: Shape): void {

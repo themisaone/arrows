@@ -17,12 +17,15 @@ import {
 import {
   Figure,
   Group,
+  resetShapeRenderCounters,
   type Figure as FigureType,
 } from "../utils/shapes";
 
 const STORAGE_KEY = "arrows.script";
 const LAYOUT_REROLL_KEY = "arrows.layoutReroll";
 const DEFAULT_URL = "/figure.txt";
+const CANVAS_WIDTH = 1000;
+const CANVAS_HEIGHT = 760;
 
 function readLayoutRerollFromSession(): string {
   try {
@@ -101,6 +104,10 @@ const GeometryCanvas: React.FC = () => {
   const [showScriptDotCommands, setShowScriptDotCommands] = useState(true);
   /** When false, hide white drag rings on the canvas (edit points in the script instead). */
   const [showDragHandles, setShowDragHandles] = useState(true);
+  const [drawAnimation, setDrawAnimation] = useState(true);
+  const [drawSegmentMs, setDrawSegmentMs] = useState(260);
+  const [centerImage, setCenterImage] = useState(true);
+  const [drawAppliedSteps, setDrawAppliedSteps] = useState(0);
   /** Bumped to re-seed perp / nest / spike randomness without editing the script (persisted in sessionStorage). */
   const [layoutRerollNonce, setLayoutRerollNonce] = useState(readLayoutRerollFromSession);
   const scriptTextareaRef = useRef<HTMLTextAreaElement>(null);
@@ -144,8 +151,16 @@ const GeometryCanvas: React.FC = () => {
         : null,
     [script, stepThrough, parseOpts]
   );
+  const animatedParse = useMemo(
+    () =>
+      drawAnimation && !stepThrough
+        ? parse(script, undefined, { stepped: true, ...parseOpts })
+        : null,
+    [script, drawAnimation, stepThrough, parseOpts]
+  );
 
   const steps: BuildStep[] | undefined = steppedParse?.buildSteps;
+  const animatedSteps: BuildStep[] | undefined = animatedParse?.buildSteps;
 
   useLayoutEffect(() => {
     if (!stepThrough) return;
@@ -153,7 +168,30 @@ const GeometryCanvas: React.FC = () => {
     setBuildLog([BUILD_LOG_INTRO]);
   }, [stepThrough, script]);
 
+  useLayoutEffect(() => {
+    if (!drawAnimation || stepThrough) return;
+    setDrawAppliedSteps(0);
+  }, [drawAnimation, stepThrough, script, parseOpts]);
+
+  useEffect(() => {
+    if (!drawAnimation || stepThrough) return;
+    const total = animatedSteps?.length ?? 0;
+    if (total === 0 || drawAppliedSteps >= total) return;
+    const t = window.setTimeout(
+      () => setDrawAppliedSteps((n) => Math.min(n + 1, total)),
+      Math.max(20, drawSegmentMs)
+    );
+    return () => window.clearTimeout(t);
+  }, [drawAnimation, stepThrough, animatedSteps, drawAppliedSteps, drawSegmentMs]);
+
   const displayFigure = useMemo(() => {
+    if (!stepThrough && drawAnimation && animatedSteps?.length) {
+      const replayFig = new Figure();
+      for (let i = 0; i < drawAppliedSteps && i < animatedSteps.length; i++) {
+        animatedSteps[i]!.apply(replayFig);
+      }
+      return replayFig;
+    }
     if (!stepThrough || !steps?.length) {
       return fullParse.figure;
     }
@@ -164,7 +202,17 @@ const GeometryCanvas: React.FC = () => {
       r.buildSteps![i].apply(replayFig);
     }
     return replayFig;
-  }, [script, stepThrough, steps, appliedSteps, fullParse.figure, parseOpts]);
+  }, [
+    script,
+    stepThrough,
+    drawAnimation,
+    animatedSteps,
+    drawAppliedSteps,
+    steps,
+    appliedSteps,
+    fullParse.figure,
+    parseOpts,
+  ]);
 
   const nextStepPreview = useMemo(() => {
     if (!stepThrough || !steps?.length || appliedSteps >= steps.length) {
@@ -221,15 +269,38 @@ const GeometryCanvas: React.FC = () => {
     setScript((prev) => updatePointInScript(prev, drag, p.x, p.y));
   };
 
-  const scene = useMemo(() => {
-    return new Group([
-      displayFigure,
-      new Group([fullParse.figure], "translate(840 40) scale(0.18)"),
-    ]);
-  }, [displayFigure, fullParse.figure]);
+  const sceneNode = useMemo(() => {
+    resetShapeRenderCounters();
+    return displayFigure.render();
+  }, [displayFigure, script, stepThrough, appliedSteps, layoutRerollNonce, drawAnimation, drawSegmentMs]);
+
+  const miniPreviewNode = useMemo(() => {
+    resetShapeRenderCounters();
+    return new Group([fullParse.figure], "translate(840 40) scale(0.18)").render();
+  }, [fullParse.figure, script, layoutRerollNonce]);
+
+  const viewBox = useMemo(() => {
+    const b = displayFigure.bounds();
+    const halfW = CANVAS_WIDTH * 0.5;
+    const halfH = CANVAS_HEIGHT * 0.5;
+    if (!centerImage || !b) {
+      return { minX: 0, minY: 0, width: CANVAS_WIDTH, height: CANVAS_HEIGHT };
+    }
+    const cx = (b.minX + b.maxX) * 0.5;
+    const cy = (b.minY + b.maxY) * 0.5;
+    return {
+      minX: cx - halfW,
+      minY: cy - halfH,
+      width: CANVAS_WIDTH,
+      height: CANVAS_HEIGHT,
+    };
+  }, [displayFigure, centerImage]);
 
   const handles: Array<{ name: string; x: number; y: number }> = [];
+  const seenHandleNames = new Set<string>();
   for (const name of fullParse.freePoints) {
+    if (seenHandleNames.has(name)) continue;
+    seenHandleNames.add(name);
     try {
       const p = displayFigure.pt(name);
       handles.push({ name, x: p.x, y: p.y });
@@ -317,6 +388,47 @@ const GeometryCanvas: React.FC = () => {
             />
             Drag handles
           </label>
+          <label
+            className="flex items-center gap-1.5 text-xs font-medium text-slate-700 cursor-pointer select-none"
+            title="Animate the figure as if drawn stroke-by-stroke."
+          >
+            <input
+              type="checkbox"
+              checked={drawAnimation}
+              onChange={(e) => setDrawAnimation(e.target.checked)}
+              className="rounded border-slate-400"
+            />
+            Draw animation
+          </label>
+          <label
+            className="flex items-center gap-1.5 text-xs font-medium text-slate-700 cursor-pointer select-none"
+            title="Pan camera so current drawing stays centered in the viewport."
+          >
+            <input
+              type="checkbox"
+              checked={centerImage}
+              onChange={(e) => setCenterImage(e.target.checked)}
+              className="rounded border-slate-400"
+            />
+            Center image
+          </label>
+          {drawAnimation && (
+            <label
+              className="flex items-center gap-1.5 text-xs font-medium text-slate-700"
+              title="Lower = faster reveal; higher = slower line-by-line drawing."
+            >
+              Speed
+              <input
+                type="range"
+                min={80}
+                max={520}
+                step={1}
+                value={drawSegmentMs}
+                onChange={(e) => setDrawSegmentMs(Number(e.target.value))}
+                className="w-24"
+              />
+            </label>
+          )}
           <label className="text-xs font-semibold px-3 py-1.5 rounded border border-slate-300 hover:bg-slate-100 bg-white cursor-pointer">
             Load file...
             <input
@@ -418,13 +530,27 @@ const GeometryCanvas: React.FC = () => {
           <div className="flex-grow bg-white rounded-lg shadow-md overflow-hidden min-h-[200px]">
             <svg
               ref={svgRef}
-              viewBox="0 0 1000 760"
+              viewBox={`${viewBox.minX} ${viewBox.minY} ${viewBox.width} ${viewBox.height}`}
               className="w-full h-full touch-none select-none"
               onPointerMove={onPointerMove}
               onPointerUp={() => setDrag(null)}
               onPointerLeave={() => setDrag(null)}
             >
-              {scene.render()}
+              <rect
+                x={viewBox.minX + 1}
+                y={viewBox.minY + 1}
+                width={viewBox.width - 2}
+                height={viewBox.height - 2}
+                fill="none"
+                stroke="#94a3b8"
+                strokeWidth={1.5}
+                strokeDasharray="7 5"
+                pointerEvents="none"
+              />
+              <g key={`scene-anim-${script.length}-${layoutRerollNonce}-${stepThrough}-${appliedSteps}-${drawAnimation ? 1 : 0}-${drawSegmentMs}`}>
+                {sceneNode}
+              </g>
+              <g className="no-draw-animate">{miniPreviewNode}</g>
               {stepThrough &&
                 nextStepPreview &&
                 renderHelperLines(
@@ -433,6 +559,9 @@ const GeometryCanvas: React.FC = () => {
                   helperKey
                 )}
               {showDragHandles &&
+                (!drawAnimation ||
+                  stepThrough ||
+                  drawAppliedSteps >= (animatedSteps?.length ?? 0)) &&
                 handles.map((h) => (
                   <circle
                     key={h.name}
@@ -519,6 +648,9 @@ const GeometryCanvas: React.FC = () => {
       </div>
 
       <p className="text-xs text-slate-500 mt-2">
+        Canvas/frame size: <code>{CANVAS_WIDTH}</code> × <code>{CANVAS_HEIGHT}</code> px.
+        The dashed rectangle shows this exact extent.
+        {" "}
         Edit the script on the left to change the figure. Drag any draggable handle
         (explicit <code>point</code>, <code>perp</code> labels, or an inferred nest apex
         such as <code>T1c</code>); coordinates are written back into the script (nest

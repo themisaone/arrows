@@ -8,16 +8,16 @@
 # --------------------------------------------------------------------
 
 # Average length of distance in shape-triangles
-const averageSize         120
+const averageSize         80
 ## Percentage in variation (meaning: from 120 - 180)
 const averageSpan         20
 
 # Average height of tube  (50% of size above)
-const tubeAverageHeight   50
+const tubeAverageHeight   36
 ## Percentage in variation (meaning: from 80 - 120)
 const tubeAverageSpan     20
 
-const topDisplacement     60
+const topDisplacement     40
 
 # Bends (dimensionless)
 const bigBend        0.24
@@ -27,17 +27,17 @@ const distance       0.20
 
 # Nest apex / auto-nest: re-pick apex when an apex lands inside an already filled area.
 const nestLayoutMaxAttempts 8
+const doubleInnProbability 30
 
 # After each `myShape`, N batch passes: each pass nests every open T*a/T*b pair from the previous wave.
 const nestContinuations 3
 # Last pass (when N≥2): rim-only “arrow” tips — no blade/tube. `const continuationEndArrow 0` keeps full tubes on every pass.
 
 # Compact layout for nesting several shapes on one page
-point A 400 300
-point B 380 420
-point C 520 380
+point A 500 300
+point B 480 380
+point C 580 350
 
 myShape A B C out in in
 
 dot A B C
-

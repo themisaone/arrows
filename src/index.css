@@ -12,3 +12,44 @@ html, body, #root {
   height: 100%;
   min-height: 100vh;
 }
+
+/* Stroke-by-stroke drawing perception (used by GeometryCanvas). */
+svg.draw-animate .draw-stroke {
+  stroke-dasharray: 1;
+  stroke-dashoffset: 1;
+  animation: draw-stroke-reveal var(--draw-segment-duration, 260ms) linear forwards;
+  animation-delay: calc(
+    var(--draw-order, 0) * var(--draw-segment-duration, 260ms)
+  );
+}
+
+svg.draw-animate .draw-fill {
+  opacity: 0;
+  animation: draw-fill-reveal 1ms linear forwards;
+  animation-delay: calc(
+    var(--draw-order, 0) * var(--draw-segment-duration, 260ms) + var(--draw-fill-lag, 140ms)
+  );
+}
+
+/* Keep mini preview static while main canvas animates. */
+svg.draw-animate .no-draw-animate .draw-stroke {
+  animation: none;
+  stroke-dasharray: none;
+  stroke-dashoffset: 0;
+}
+svg.draw-animate .no-draw-animate .draw-fill {
+  animation: none;
+  opacity: 1;
+}
+
+@keyframes draw-stroke-reveal {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+@keyframes draw-fill-reveal {
+  to {
+    opacity: 1;
+  }
+}

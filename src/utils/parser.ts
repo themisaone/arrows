@@ -62,6 +62,11 @@ import {
  *                                      # inside an already-filled region (tube/spike area).
  *                                      # Default **12**. Emits soft {@link ParseResult.infos}
  *                                      # lines for retries / skipped branches.
+ *   const doubleInnProbability P       # optional percent (0..100). For inferred/auto
+ *                                      # nests only: when apex projection on p1-p2 is
+ *                                      # within 50% of chord length from the midpoint,
+ *                                      # choose BOTH new sides as `in` with probability P.
+ *                                      # This can produce two continuation pairs.
  *   const continuationEndArrow 0|1    # optional. When **1** (default), the **last**
  *                                      # continuation pass (requires nestContinuations ≥ 2)
  *                                      # draws the two new sides as **rim-only** arcs
@@ -349,6 +354,29 @@ function scanFreePointNamesFromScript(script: string): string[] {
   return out;
 }
 
+function uniqueNamesInOrder(names: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const n of names) {
+    if (seen.has(n)) continue;
+    seen.add(n);
+    out.push(n);
+  }
+  return out;
+}
+
+/** Names declared via literal `point NAME X Y` lines. */
+function scanExplicitPointLineNames(script: string): Set<string> {
+  const out = new Set<string>();
+  for (const line of script.split("\n")) {
+    const toks = line.replace(/#.*/, "").trim().split(/\s+/);
+    if (toks[0]?.toLowerCase() === "point" && toks.length >= 2) {
+      out.add(toks[1]!);
+    }
+  }
+  return out;
+}
+
 export function parse(
   script: string,
   style?: Style,
@@ -363,6 +391,7 @@ export function parse(
   const buildSteps: BuildStep[] = [];
   const implicitNestApexes: ImplicitNestApexInfo[] = [];
   const scriptLines = script.split("\n");
+  const explicitPointLineNames = scanExplicitPointLineNames(script);
   const showMacroHelperLabels = options?.showMacroHelperLabels !== false;
   const showScriptDots = options?.showScriptDots !== false;
   const macroVis = (f: Figure, nm: string) => {
@@ -483,6 +512,14 @@ export function parse(
       return Math.max(1, Math.floor(consts.get("nestLayoutMaxAttempts")!));
     }
     return 12;
+  };
+
+  /** Percent chance (0..100) to force inferred/auto nests to `in`+`in` near midpoint. */
+  const doubleInnProbabilityPct = (): number => {
+    if (!consts.has("doubleInnProbability")) return 0;
+    const p = consts.get("doubleInnProbability")!;
+    if (!Number.isFinite(p)) return 0;
+    return Math.max(0, Math.min(100, p));
   };
 
   const parseDir = (raw: string): "in" | "out" => {
@@ -795,6 +832,9 @@ export function parse(
         ? `nest: place apex ${name} — ⊥ from ${p1}–${p2} midpoint away from host body (${refToken}), same bands as perp`
         : `perp ${name}: from chord ${p1}–${p2} midpoint, offset ⊥ by averageSize±averageSpan%, then parallel slide ≤ ${topDispPct()}% of averageSize along chord (away from ref ${refToken})`;
     pushStep(stepMsg, [{ from: p1, to: p2 }], (f) => {
+        if (stepKind === "nest" && explicitPointLineNames.has(name) && f.has(name)) {
+          return;
+        }
         const refNm = resolveRefOn(f, refToken);
         const P1 = f.pt(p1);
         const P2 = f.pt(p2);
@@ -824,10 +864,19 @@ export function parse(
         }
         const maxPar = (topDispPct() / 100) * avgSize();
         const t = (2 * rng() - 1) * maxPar;
-        f.point(name, {
+        const cand = {
           x: mx + nx * h + ux * t,
           y: my + ny * h + uy * t,
-        });
+        };
+        const ch = crossProdZ(P1, P2, R);
+        const ca = crossProdZ(P1, P2, cand);
+        const mustMirror = Math.abs(ch) > 1e-9 && ch * ca > 0;
+        f.point(
+          name,
+          mustMirror
+            ? { x: mx - nx * h + ux * t, y: my - ny * h + uy * t }
+            : cand
+        );
     });
   };
 
@@ -840,6 +889,7 @@ export function parse(
       `nest: place apex ${name} — random L/R ⊥ from ${p1}–${p2} midpoint (anchors had no host body; same bands as perp)`,
       [{ from: p1, to: p2 }],
       (f) => {
+        if (explicitPointLineNames.has(name) && f.has(name)) return;
         const P1 = f.pt(p1);
         const P2 = f.pt(p2);
         const dx = P2.x - P1.x;
@@ -882,6 +932,7 @@ export function parse(
     p2: string,
     tryIdx: number
   ) => {
+    if (explicitPointLineNames.has(name) && f.has(name)) return;
     const P1 = f.pt(p1);
     const P2 = f.pt(p2);
     const dx = P2.x - P1.x;
@@ -927,6 +978,7 @@ export function parse(
     refToken: string,
     tryIdx: number
   ) => {
+    if (explicitPointLineNames.has(name) && f.has(name)) return;
     const refNm = resolveRefOn(f, refToken);
     const P1 = f.pt(p1);
     const P2 = f.pt(p2);
@@ -957,10 +1009,19 @@ export function parse(
     }
     const maxPar = (topDispPct() / 100) * avgSize();
     const t = (2 * rng() - 1) * maxPar;
-    f.point(name, {
+    const cand = {
       x: mx + nx * h + ux * t,
       y: my + ny * h + uy * t,
-    });
+    };
+    const ch = crossProdZ(P1, P2, R);
+    const ca = crossProdZ(P1, P2, cand);
+    const mustMirror = Math.abs(ch) > 1e-9 && ch * ca > 0;
+    f.point(
+      name,
+      mustMirror
+        ? { x: mx - nx * h + ux * t, y: my - ny * h + uy * t }
+        : cand
+    );
   };
 
   /** Counter so `myShape` / `nest` can mint unique helper-point names per call. */
@@ -1073,6 +1134,53 @@ export function parse(
     };
   };
 
+  /** Apex projection displacement from midpoint as percent of full chord length (endpoint ~= 50%). */
+  const apexProjectionMidDisplacementPct = (
+    p1n: string,
+    p2n: string,
+    p3n: string,
+    targetFig: Figure
+  ): number => {
+    const A = targetFig.pt(p1n);
+    const B = targetFig.pt(p2n);
+    const C = targetFig.pt(p3n);
+    const L = distance(A, B) || 1;
+    const foot = footOnLineThrough(A, B, C);
+    const mx = (A.x + B.x) * 0.5;
+    const my = (A.y + B.y) * 0.5;
+    const ux = (B.x - A.x) / L;
+    const uy = (B.y - A.y) / L;
+    const along = Math.abs((foot.x - mx) * ux + (foot.y - my) * uy);
+    return (along / L) * 100;
+  };
+
+  const maybeApplyDoubleInn = (
+    p1n: string,
+    p2n: string,
+    p3n: string,
+    d13: "in" | "out",
+    d23: "in" | "out",
+    seedTag: string
+  ): {
+    d13: "in" | "out";
+    d23: "in" | "out";
+    applied: boolean;
+    displacementPct: number;
+  } => {
+    const p = doubleInnProbabilityPct();
+    if (p <= 0) return { d13, d23, applied: false, displacementPct: 100 };
+    if (d13 === d23) return { d13, d23, applied: false, displacementPct: 100 };
+    const dispPct = apexProjectionMidDisplacementPct(p1n, p2n, p3n, fig);
+    if (dispPct >= 50) {
+      return { d13, d23, applied: false, displacementPct: dispPct };
+    }
+    const rng = mulberry32(seedFor(`${seedTag}|doubleInn`));
+    if (rng() * 100 < p) {
+      return { d13: "in", d23: "in", applied: true, displacementPct: dispPct };
+    }
+    return { d13, d23, applied: false, displacementPct: dispPct };
+  };
+
   /**
    * Emit a single edge of a "thorny triangle" shape:
    *   - always: a **rim** arc <a>-<b> bulging **away from** triangle centroid `bodyName`
@@ -1093,18 +1201,21 @@ export function parse(
     suf: string,
     bodyName: string,
     k: number,
-    opts?: { skipAnchors?: boolean }
+    opts?: { skipAnchors?: boolean; rimOnly?: boolean; rimUsesMode?: boolean }
   ) => {
     const big = constOr("bigBend");
+    const rimDir: "in" | "out" = opts?.rimUsesMode ? mode : "out";
     const rimNote =
       mode === "in"
-        ? `Rim arc (bigBend=${big}): bulges **away from** triangle centroid ${bodyName} (arc dir=out, ref=body — not the same as edge token \`out\`). Edge mode **in** → next steps add blade + opaque tube on this side.`
+        ? rimDir === "in"
+          ? `Rim arc (bigBend=${big}): bulges **toward** triangle centroid ${bodyName} (terminal rim-only mode).`
+          : `Rim arc (bigBend=${big}): bulges **away from** triangle centroid ${bodyName} (arc dir=out, ref=body — not the same as edge token \`out\`). Edge mode **in** → next steps add blade + opaque tube on this side.`
         : `Rim arc only (bigBend=${big}, away from ${bodyName}); edge mode **out** → no blade/tube.`;
     pushStep(`Shape edge ${a}–${b}: ${rimNote}`, [{ from: a, to: b }], (f) => {
-      f.arc(a, b, { bend: big, dir: "out", ref: bodyName, style });
+      f.arc(a, b, { bend: big, dir: rimDir, ref: bodyName, style });
     });
 
-    if (mode !== "in") return;
+    if (mode !== "in" || opts?.rimOnly) return;
 
     const F = `_ms${id}_F${suf}`;
     const G = `_ms${id}_G${suf}`;
@@ -1190,10 +1301,10 @@ export function parse(
       y: (A.y + B.y) * 0.5,
     };
     const footPre = footOnLineThrough(A, B, C);
-    const eff13: "in" | "out" = arrowTerminal ? "out" : d13;
-    const eff23: "in" | "out" = arrowTerminal ? "out" : d23;
+    const eff13: "in" | "out" = d13;
+    const eff23: "in" | "out" = d23;
     const terminalNote = arrowTerminal
-      ? `\n**Terminal (arrow):** both sides ${p1}–${p3} and ${p2}–${p3} are drawn as **rim-only** (outward arcs toward ${bodyName}) — no blade, spike, or tube tops.\n`
+      ? `\n**Terminal (arrow):** both sides ${p1}–${p3} and ${p2}–${p3} are drawn as **rim-only** arcs with the same inferred in/out chirality — no blade, spike, or tube tops.\n`
       : "";
     pushStep(
       `${stepNotePrefix}nest (step-through notes): edge modes toward ${p3}${terminalNote}\n${formatNestApexSwapRationale(
@@ -1207,7 +1318,7 @@ export function parse(
       )}\n` +
         `Markers: **${anchorMidName}** = midpoint of ${p1}–${p2} (≈ ${midPre.x.toFixed(1)}, ${midPre.y.toFixed(1)}). **${apexProjName}** = projection of ${p3} onto the infinite line ${p1}–${p2} (≈ ${footPre.x.toFixed(1)}, ${footPre.y.toFixed(1)}) — compare to “left/right of midpoint”. ` +
         (arrowTerminal
-          ? `Each new side is a single rim arc away from ${bodyName} (no inward blade or tube).`
+          ? `Each new side is a single rim arc using its inferred in/out direction on the rim only (no blade or tube).`
           : `Later “rim arc … away from ${bodyName}” is the **perimeter bowing away from the new triangle centroid**, not the script token \`out\`/\`in\`; mode **in** adds blade+tube **after** that rim arc.`),
       [
         { from: p1, to: p2 },
@@ -1274,7 +1385,10 @@ export function parse(
       [p2, p3, eff23, "23"],
     ];
     for (const [a, b, mode, suf] of edges) {
-      emitShapeEdge(id, a, b, mode, suf, bodyName, k);
+      emitShapeEdge(id, a, b, mode, suf, bodyName, k, {
+        rimOnly: arrowTerminal,
+        rimUsesMode: arrowTerminal,
+      });
     }
 
     if (!hostRef) {
@@ -1426,16 +1540,19 @@ export function parse(
     label: string;
     /** When false (e.g. eight-token `nest`), do not register apex in `freePoints`. Default true. */
     trackFreePointApex?: boolean;
+    /** Enable probabilistic inferred-mode `in`+`in` override near midpoint. */
+    allowDoubleInn?: boolean;
   }) => {
     const maxT = stepped ? 1 : nestLayoutMaxAttempts();
     const wave = opts.nextWave ?? [];
     const cp = saveParseCheckpoint(wave);
     const trackFp = opts.trackFreePointApex !== false;
+    const pinnedApex = explicitPointLineNames.has(opts.p3);
     for (let k = 0; k < maxT; k++) {
       restoreParseCheckpoint(cp, wave);
       opts.placeApexSilent(k);
       const apex = fig.pt(opts.p3);
-      if (fig.isPointInsideAnyFilledRegion(apex)) {
+      if (!pinnedApex && fig.isPointInsideAnyFilledRegion(apex)) {
         if (k < maxT - 1) {
           infos.push(
             `${opts.label}: RETRY ${k + 2}/${maxT} — apex ${opts.p3} falls inside an existing filled area.`
@@ -1456,6 +1573,23 @@ export function parse(
       if (r.swap) {
         d13 = "in";
         d23 = "out";
+      }
+      if (opts.allowDoubleInn && !opts.arrowTerminal) {
+        const m = maybeApplyDoubleInn(
+          opts.p1,
+          opts.p2,
+          opts.p3,
+          d13,
+          d23,
+          `${opts.p1}|${opts.p2}|${opts.p3}|try${k}`
+        );
+        d13 = m.d13;
+        d23 = m.d23;
+        if (m.applied) {
+          infos.push(
+            `${opts.label}: doubleInn applied (disp ${m.displacementPct.toFixed(1)}% < 50%).`
+          );
+        }
       }
       const meta =
         opts.nestUserScriptedMetaFn?.(r) ?? opts.nestUserScriptedMeta;
@@ -1756,6 +1890,7 @@ export function parse(
                       stepNotePrefix: stepPf,
                       arrowTerminal,
                       label: `Auto nest ${na}–${nb}`,
+                      allowDoubleInn: true,
                     });
                   } else {
                     if (hostBody) {
@@ -1771,6 +1906,23 @@ export function parse(
                     if (rAuto.swap) {
                       da13 = "in";
                       da23 = "out";
+                    }
+                    if (!arrowTerminal) {
+                      const mAuto = maybeApplyDoubleInn(
+                        na,
+                        nb,
+                        p3a,
+                        da13,
+                        da23,
+                        `${na}|${nb}|${p3a}|auto`
+                      );
+                      da13 = mAuto.d13;
+                      da23 = mAuto.d23;
+                      if (mAuto.applied) {
+                        infos.push(
+                          `Auto nest ${na}–${nb}: doubleInn applied (disp ${mAuto.displacementPct.toFixed(1)}% < 50%).`
+                        );
+                      }
                     }
                     emitNestGeometry(
                       na,
@@ -1875,6 +2027,7 @@ export function parse(
                 stepNotePrefix: "",
                 arrowTerminal: false,
                 label: `nest ${p1} ${p2}→${p3}`,
+                allowDoubleInn: true,
               });
               nestEmitDone = true;
             } else {
@@ -1891,6 +2044,21 @@ export function parse(
               if (r3.swap) {
                 d13 = "in";
                 d23 = "out";
+              }
+              const m3 = maybeApplyDoubleInn(
+                p1,
+                p2,
+                p3,
+                d13,
+                d23,
+                `${p1}|${p2}|${p3}|nest3`
+              );
+              d13 = m3.d13;
+              d23 = m3.d23;
+              if (m3.applied) {
+                infos.push(
+                  `nest ${p1} ${p2}: doubleInn applied (disp ${m3.displacementPct.toFixed(1)}% < 50%).`
+                );
               }
               implicitNestApexes.push({
                 apex: p3,
@@ -1943,6 +2111,7 @@ export function parse(
                 stepNotePrefix: "",
                 arrowTerminal: false,
                 label: `nest ${p1} ${p2} ${refTok}→${p3}`,
+                allowDoubleInn: true,
               });
               nestEmitDone = true;
             } else {
@@ -1955,6 +2124,21 @@ export function parse(
               if (r4.swap) {
                 d13 = "in";
                 d23 = "out";
+              }
+              const m4 = maybeApplyDoubleInn(
+                p1,
+                p2,
+                p3,
+                d13,
+                d23,
+                `${p1}|${p2}|${p3}|nest4`
+              );
+              d13 = m4.d13;
+              d23 = m4.d23;
+              if (m4.applied) {
+                infos.push(
+                  `nest ${p1} ${p2} ${refTok}: doubleInn applied (disp ${m4.displacementPct.toFixed(1)}% < 50%).`
+                );
               }
               implicitNestApexes.push({
                 apex: p3,
@@ -2138,7 +2322,9 @@ export function parse(
     figure: fig,
     errors,
     infos: infos.length > 0 ? infos : undefined,
-    freePoints: stepped ? scanFreePointNamesFromScript(script) : freePoints,
+    freePoints: uniqueNamesInOrder(
+      stepped ? scanFreePointNamesFromScript(script) : freePoints
+    ),
     implicitNestApexes,
     buildSteps: stepped ? buildSteps : undefined,
   };
@@ -2211,6 +2397,28 @@ export function updatePointInScript(
       lines.splice(idx, 1, ptLine, nestWithComment);
       return lines.join("\n");
     }
+  }
+
+  // Auto-generated continuation apex: make it persistent on first drag by
+  // materializing a literal `point` before macro/nest expansion commands.
+  const parsed = parse(script);
+  if (parsed.freePoints.includes(name)) {
+    const lines = script.split("\n");
+    const rx = Math.round(x);
+    const ry = Math.round(y);
+    const ptLine = `point ${name} ${rx} ${ry}`;
+    let insertAt = lines.length;
+    for (let i = 0; i < lines.length; i++) {
+      const stripped = lines[i]!.replace(/#.*/, "").trim();
+      if (!stripped) continue;
+      const cmd = stripped.split(/\s+/)[0]?.toLowerCase();
+      if (cmd === "myshape" || cmd === "nest") {
+        insertAt = i;
+        break;
+      }
+    }
+    lines.splice(insertAt, 0, ptLine);
+    return lines.join("\n");
   }
 
   return script;
