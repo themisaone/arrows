@@ -62,6 +62,21 @@ import {
  *                                      # inside an already-filled region (tube/spike area).
  *                                      # Default **12**. Emits soft {@link ParseResult.infos}
  *                                      # lines for retries / skipped branches.
+ *   const nestApexPlacement 1|2       # optional. **1** (default): nest apex = midpoint
+ *                                      # of anchor chord, ⊥ offset away from host/ref
+ *                                      # (same bands as `perp`) + parallel slide along chord.
+ *                                      # **2**: choose LEFT/RIGHT (toward first/second anchor
+ *                                      # along the chord), then place apex on a guide arc that
+ *                                      # starts at chord midpoint, stays on the opposite side
+ *                                      # of the anchor chord line, and ends half-chord beyond
+ *                                      # the selected anchor; with a host/ref, may
+ *                                      # mirror across the chord like mode **1** so the apex
+ *                                      # stays on the tube-opening side. With **Step-through**
+ *                                      # on, mode **2** splits into three UI steps: **LEFT** /
+ *                                      # **RIGHT** (toward first vs second anchor along the
+ *                                      # chord), then a magenta preview of the admissible arc
+ *                                      # plus a short gray ⊥ bisector tick at the midpoint,
+ *                                      # then placing the apex on the arc.
  *   const doubleInnProbability P       # optional percent (0..100). For inferred/auto
  *                                      # nests only: when apex projection on p1-p2 is
  *                                      # within 50% of chord length from the midpoint,
@@ -79,7 +94,7 @@ import {
  *   arc   FROM TO in|out REF BEND     # bend toward/away from REF
  *   blade FROM TO IN1 IN2 in|out REF  # outer arc + paired inner arc
  *                                      # uses bigBend / smallBend / distance
- *                                      # (defaults: 0.22 / 0.16 / 0.20)
+ *                                      # (defaults: 0.22 / 0.16 / 20[%])
  *   const tubeBend B                  # side legs of each tube/spike (arcs from
  *                                      # inner chord points F,G toward tips X,Y;
  *                                      # default 0.06). Cap still uses smallBend.
@@ -205,6 +220,16 @@ import {
 /** Gray helper segment between two named points (resolved when the step is shown). */
 export type HelperLineSpec = { from: string; to: string };
 
+/** Step-through preview: polyline in figure coordinates (e.g. nest apex option 2 arc). */
+export type HelperPolylineSpec = {
+  points: Point[];
+  stroke?: string;
+  strokeWidth?: number;
+};
+
+/** Step-through preview: arbitrary segment in figure coordinates (e.g. ⊥ bisector tick). */
+export type HelperSegmentSpec = { a: Point; b: Point };
+
 /** One atomic build action for step-through mode (Enter advances). */
 export type BuildStep = {
   lineNum: number;
@@ -212,6 +237,10 @@ export type BuildStep = {
   sourceLine: string;
   message: string;
   helperLines?: HelperLineSpec[];
+  helperPolylines?: HelperPolylineSpec[];
+  helperSegments?: HelperSegmentSpec[];
+  /** Highlight upcoming point placement (figure coords). */
+  helperDots?: Point[];
   /** Mutates the given figure (replay uses a fresh `Figure` per run). */
   apply: (f: Figure) => void;
 };
@@ -277,7 +306,8 @@ const BLADE_DEFAULTS = {
   smallBend: 0.16,
   /** Quadratic bend along each tube/spike leg (e.g. `_ms*_F` → `_ms*_X`). */
   tubeBend: 0.06,
-  distance: 0.2,
+  /** Percent (0..100) from edge ends to inner anchors F/G (legacy <=1 accepted as fraction). */
+  distance: 20,
 } as const;
 
 /** Background color used to paint the opaque interior of `tube`/`spike`. */
@@ -410,10 +440,17 @@ export function parse(
    * parse-time figure stays consistent for later script lines. The UI replays
    * by applying the first N recorded `apply` closures to a **fresh** figure.
    */
+  type PushStepExtras = {
+    helperPolylines?: HelperPolylineSpec[];
+    helperSegments?: HelperSegmentSpec[];
+    helperDots?: Point[];
+  };
+
   const pushStep = (
     message: string,
     helperLines: HelperLineSpec[] | undefined,
-    apply: (f: Figure) => void
+    apply: (f: Figure) => void,
+    extras?: PushStepExtras
   ) => {
     if (stepped) {
       buildSteps.push({
@@ -421,6 +458,9 @@ export function parse(
         sourceLine: scriptLines[scriptLineNum - 1] ?? "",
         message,
         helperLines,
+        helperPolylines: extras?.helperPolylines,
+        helperSegments: extras?.helperSegments,
+        helperDots: extras?.helperDots,
         apply,
       });
     }
@@ -482,6 +522,16 @@ export function parse(
   };
 
   /**
+   * `distance` as fraction in [0,1].
+   * Preferred input is percent (e.g. 20 -> 0.20); legacy fraction (<=1) still works.
+   */
+  const distanceFrac = (): number => {
+    const raw = constOr("distance");
+    const frac = raw <= 1 ? raw : raw / 100;
+    return Math.max(0, Math.min(0.49, frac));
+  };
+
+  /**
    * Max **passes** (batch iterations) of auto-`nest` after each `myShape`; 0 = off.
    * Reads `nestContinuations` or `continuations`.
    */
@@ -512,6 +562,24 @@ export function parse(
       return Math.max(1, Math.floor(consts.get("nestLayoutMaxAttempts")!));
     }
     return 12;
+  };
+
+  /**
+   * **1** — perpendicular from chord midpoint (same as `perp` nest path).
+   * **2** — choose LEFT/RIGHT and place apex on a constrained guide arc:
+   * from chord midpoint to half-chord beyond the selected anchor, on the
+   * opposite side of the anchor chord line.
+   */
+  const nestApexPlacementMode = (): 1 | 2 => {
+    const keys = ["nestApexPlacement", "apexPlacement", "nestApexPlacementOption"];
+    for (const k of keys) {
+      if (consts.has(k)) {
+        const v = Math.floor(consts.get(k)!);
+        if (v === 2) return 2;
+        return 1;
+      }
+    }
+    return 1;
   };
 
   /** Percent chance (0..100) to force inferred/auto nests to `in`+`in` near midpoint. */
@@ -577,7 +645,7 @@ export function parse(
   ) => {
     const big = constOr("bigBend");
     const small = constOr("smallBend");
-    const d = constOr("distance");
+    const d = distanceFrac();
     pushStep(
       `Blade: outer arc ${from}→${to} (bigBend=${big}, dir=${dir}, ref=${refTok})`,
       [{ from, to }],
@@ -591,7 +659,7 @@ export function parse(
       }
     );
     pushStep(
-      `Blade: inner anchors — ${in1} = lerp(${from},${to}, ${d}), ${in2} = lerp(${from},${to}, ${(1 - d).toFixed(2)})  (distance const = ${d})`,
+      `Blade: inner anchors — ${in1} = lerp(${from},${to}, ${d.toFixed(3)}), ${in2} = lerp(${from},${to}, ${(1 - d).toFixed(3)})  (distance const = ${(d * 100).toFixed(1)}%)`,
       [{ from, to }],
       (f) => {
         f.lerpPoint(in1, from, to, d);
@@ -643,6 +711,31 @@ export function parse(
   /**
    * Opaque interior of a tube/spike (must be drawn before boundary arcs).
    */
+  const emitTubeRegionFromSignedBends = (
+    target: Figure,
+    p1: string,
+    p2: string,
+    q1: string,
+    q2: string,
+    sb1: number,
+    sb2: number,
+    sbCap: number
+  ) => {
+    const P1 = target.pt(p1);
+    const P2 = target.pt(p2);
+    const Q1 = target.pt(q1);
+    const Q2 = target.pt(q2);
+    const ctrl1 = perpControl(P1, Q1, sb1);
+    const ctrl2 = perpControl(P2, Q2, sb2);
+    const ctrlCap = perpControl(Q1, Q2, sbCap);
+    const segs: RegionSeg[] = [
+      { kind: "quad", ctrl: ctrl1, to: Q1 },
+      { kind: "quad", ctrl: ctrlCap, to: Q2 },
+      { kind: "quad", ctrl: ctrl2, to: P2 },
+    ];
+    target.add(new Region(P1, segs, TUBE_FILL));
+  };
+
   const emitTubeRegionOnly = (
     target: Figure,
     p1: string,
@@ -666,16 +759,7 @@ export function parse(
     const sb2 = resolveSignedBend(P2, Q2, R, dir, leg);
     const sbCap = resolveSignedBend(Q1, Q2, R, cap, small);
 
-    const ctrl1 = perpControl(P1, Q1, sb1);
-    const ctrl2 = perpControl(P2, Q2, sb2);
-    const ctrlCap = perpControl(Q1, Q2, sbCap);
-
-    const segs: RegionSeg[] = [
-      { kind: "quad", ctrl: ctrl1, to: Q1 },
-      { kind: "quad", ctrl: ctrlCap, to: Q2 },
-      { kind: "quad", ctrl: ctrl2, to: P2 },
-    ];
-    target.add(new Region(P1, segs, TUBE_FILL));
+    emitTubeRegionFromSignedBends(target, p1, p2, q1, q2, sb1, sb2, sbCap);
   };
 
   const emitTubeArcP1Q1 = (
@@ -722,7 +806,8 @@ export function parse(
     q1: string,
     q2: string,
     dir: "in" | "out",
-    refToken: string
+    refToken: string,
+    legFlip: "p1" | "p2" | null = null
   ) => {
     const rng = mulberry32(seedFor(`${q1}|${q2}`));
     let d1: number;
@@ -782,7 +867,19 @@ export function parse(
       ],
       (f) => {
         const refNm = resolveRefOn(f, refToken);
-        emitTubeRegionOnly(f, p1, p2, q1, q2, dir, refNm);
+        const leg = constOr("tubeBend");
+        let sb1 = resolveSignedBend(f.pt(p1), f.pt(q1), f.pt(refNm), dir, leg);
+        let sb2 = resolveSignedBend(f.pt(p2), f.pt(q2), f.pt(refNm), dir, leg);
+        if (legFlip === "p1") sb1 = -sb1;
+        if (legFlip === "p2") sb2 = -sb2;
+        const sbCap = resolveSignedBend(
+          f.pt(q1),
+          f.pt(q2),
+          f.pt(refNm),
+          dir,
+          constOr("smallBend")
+        );
+        emitTubeRegionFromSignedBends(f, p1, p2, q1, q2, sb1, sb2, sbCap);
       }
     );
 
@@ -791,7 +888,10 @@ export function parse(
       [{ from: p1, to: q1 }],
       (f) => {
         const refNm = resolveRefOn(f, refToken);
-        emitTubeArcP1Q1(f, p1, q1, dir, refNm);
+        const leg = constOr("tubeBend");
+        let sb1 = resolveSignedBend(f.pt(p1), f.pt(q1), f.pt(refNm), dir, leg);
+        if (legFlip === "p1") sb1 = -sb1;
+        f.arc(p1, q1, { bend: sb1, style });
       }
     );
 
@@ -800,7 +900,10 @@ export function parse(
       [{ from: p2, to: q2 }],
       (f) => {
         const refNm = resolveRefOn(f, refToken);
-        emitTubeArcP2Q2(f, p2, q2, dir, refNm);
+        const leg = constOr("tubeBend");
+        let sb2 = resolveSignedBend(f.pt(p2), f.pt(q2), f.pt(refNm), dir, leg);
+        if (legFlip === "p2") sb2 = -sb2;
+        f.arc(p2, q2, { bend: sb2, style });
       }
     );
 
@@ -827,12 +930,70 @@ export function parse(
     refToken: string,
     stepKind: "perp" | "nest" = "perp"
   ) => {
+    const chordHL: HelperLineSpec[] = [{ from: p1, to: p2 }];
+    if (stepKind === "nest") {
+      if (explicitPointLineNames.has(name) && fig.has(name)) {
+        pushStep(
+          `nest: apex ${name} already explicit — skip auto placement`,
+          chordHL,
+          () => {}
+        );
+        return;
+      }
+      if (nestApexPlacementMode() === 2 && stepped) {
+        const plan = planNestArcApexLayout(fig, name, p1, p2, refToken, 0);
+        if (plan) {
+          pushStep(
+            `nest apex (arc): Selected ${plan.sideLabel} — guide arc from midpoint of ${p1}–${p2} toward ${plan.centerName} side`,
+            chordHL,
+            () => {}
+          );
+          pushStep(
+          `nest apex (arc): thin gray = deciding circle (center ${plan.centerName}); magenta = admissible guide arc; gray ticks = ⊥ cuts`,
+            chordHL,
+            () => {},
+            {
+              helperPolylines: [
+                {
+                  points: plan.circlePolyline,
+                  stroke: "#94a3b8",
+                  strokeWidth: 1.2,
+                },
+                {
+                  points: plan.arcPolyline,
+                  stroke: "#a21caf",
+                  strokeWidth: 2.5,
+                },
+              ],
+              helperSegments: [...plan.bisectorTicks, { a: plan.centerPoint, b: plan.apex }],
+              helperDots: [plan.centerPoint],
+            }
+          );
+          pushStep(
+            `nest apex (arc): place ${name} on the arc${plan.wasMirrored ? " (then mirror across chord toward host opening)" : ""}`,
+            chordHL,
+            (f) => {
+              f.point(name, plan.apex);
+            },
+            { helperDots: [plan.apex] }
+          );
+          return;
+        }
+      }
+    }
+
     const stepMsg =
       stepKind === "nest"
-        ? `nest: place apex ${name} — ⊥ from ${p1}–${p2} midpoint away from host body (${refToken}), same bands as perp`
+        ? nestApexPlacementMode() === 2
+          ? `nest: place apex ${name} — arc (center ${p1}|${p2}, r=|${p1}–${p2}|) past ⊥ bisector, away-from-body mirror (${refToken})`
+          : `nest: place apex ${name} — ⊥ from ${p1}–${p2} midpoint away from host body (${refToken}), same bands as perp`
         : `perp ${name}: from chord ${p1}–${p2} midpoint, offset ⊥ by averageSize±averageSpan%, then parallel slide ≤ ${topDispPct()}% of averageSize along chord (away from ref ${refToken})`;
-    pushStep(stepMsg, [{ from: p1, to: p2 }], (f) => {
+    pushStep(stepMsg, chordHL, (f) => {
         if (stepKind === "nest" && explicitPointLineNames.has(name) && f.has(name)) {
+          return;
+        }
+        if (stepKind === "nest") {
+          computeNestApexOnFigure(f, name, p1, p2, refToken, 0);
           return;
         }
         const refNm = resolveRefOn(f, refToken);
@@ -885,41 +1046,56 @@ export function parse(
    * minting): random L/R ⊥, same distance and parallel-slide bands as `perp`.
    */
   const placeNestApexRandomLr = (name: string, p1: string, p2: string) => {
+    const chordHL: HelperLineSpec[] = [{ from: p1, to: p2 }];
+    const mode2 = nestApexPlacementMode() === 2;
+    if (explicitPointLineNames.has(name) && fig.has(name)) {
+      pushStep(
+        `nest: apex ${name} already explicit — skip auto placement`,
+        chordHL,
+        () => {}
+      );
+      return;
+    }
+    if (mode2 && stepped) {
+      const plan = planNestArcApexLayout(fig, name, p1, p2, null, 0);
+      if (plan) {
+        pushStep(
+          `nest apex (arc): Selected ${plan.sideLabel} — guide arc from midpoint of ${p1}–${p2} toward ${plan.centerName} side (no host ref)`,
+          chordHL,
+          () => {}
+        );
+        pushStep(
+          `nest apex (arc): thin gray = deciding circle (center ${plan.centerName}); magenta = admissible arc; gray ticks = ⊥ cuts`,
+          chordHL,
+          () => {},
+          {
+            helperPolylines: [
+              { points: plan.circlePolyline, stroke: "#94a3b8", strokeWidth: 1.2 },
+              { points: plan.arcPolyline, stroke: "#a21caf", strokeWidth: 2.5 },
+            ],
+            helperSegments: [...plan.bisectorTicks, { a: plan.centerPoint, b: plan.apex }],
+            helperDots: [plan.centerPoint],
+          }
+        );
+        pushStep(
+          `nest apex (arc): place ${name} on the arc`,
+          chordHL,
+          (f) => {
+            f.point(name, plan.apex);
+          },
+          { helperDots: [plan.apex] }
+        );
+        return;
+      }
+    }
     pushStep(
-      `nest: place apex ${name} — random L/R ⊥ from ${p1}–${p2} midpoint (anchors had no host body; same bands as perp)`,
-      [{ from: p1, to: p2 }],
+      mode2
+        ? `nest: place apex ${name} — arc (center ${p1}|${p2}, r=chord); anchors had no host body`
+        : `nest: place apex ${name} — random L/R ⊥ from ${p1}–${p2} midpoint (anchors had no host body; same bands as perp)`,
+      chordHL,
       (f) => {
         if (explicitPointLineNames.has(name) && f.has(name)) return;
-        const P1 = f.pt(p1);
-        const P2 = f.pt(p2);
-        const dx = P2.x - P1.x;
-        const dy = P2.y - P1.y;
-        const len = Math.hypot(dx, dy) || 1;
-        const ux = dx / len;
-        const uy = dy / len;
-        let nx = -dy / len;
-        let ny = dx / len;
-        const mx = (P1.x + P2.x) / 2;
-        const my = (P1.y + P2.y) / 2;
-        const rng = mulberry32(seedFor(`${name}|${p1}|${p2}|nestLR`));
-        if (rng() < 0.5) {
-          nx = -nx;
-          ny = -ny;
-        }
-        let h: number;
-        if (consts.has("tubeHeightLow") && consts.has("tubeHeightHigh")) {
-          const lo = consts.get("tubeHeightLow")!;
-          const hi = consts.get("tubeHeightHigh")!;
-          h = lo + rng() * (hi - lo);
-        } else {
-          h = spanBand(avgSize(), avgSpanPct(), rng);
-        }
-        const maxPar = (topDispPct() / 100) * avgSize();
-        const t = (2 * rng() - 1) * maxPar;
-        f.point(name, {
-          x: mx + nx * h + ux * t,
-          y: my + ny * h + uy * t,
-        });
+        computeNestApexOnFigure(f, name, p1, p2, null, 0);
       }
     );
   };
@@ -967,6 +1143,192 @@ export function parse(
       x: mx + nx * h + ux * t,
       y: my + ny * h + uy * t,
     });
+  };
+
+  /**
+   * Second perpendicular cut location for mode-2 arc picks, measured from midpoint
+   * along chord direction, as a fraction of chord length.
+   *
+   * With host/body ref (nested): extend beyond selected anchor.
+   * Without host/body ref (last/non-nested): keep inside anchor bounds.
+   */
+  const NEST_ARC_LIMIT_FROM_MID_FRAC_WITH_REF = 1.0;
+  const NEST_ARC_LIMIT_FROM_MID_FRAC_NO_REF = 0.5;
+
+  type NestArcApexPlan = {
+    /** Toward **p2** from midpoint = RIGHT; toward **p1** = LEFT (along chord `p1`→`p2`). */
+    sideLabel: "LEFT" | "RIGHT";
+    centerName: string;
+    centerPoint: Point;
+    circlePolyline: Point[];
+    arcPolyline: Point[];
+    bisectorTicks: HelperSegmentSpec[];
+    apex: Point;
+    wasMirrored: boolean;
+  };
+
+  /**
+   * Full nest-apex arc layout (mode **2**): choose LEFT/RIGHT and use a true
+   * circle: center at LEFT->p1 or RIGHT->p2, radius = |p1-p2|.
+   * Candidate apex points are the circle points between two perpendicular cuts
+   * to chord p1-p2:
+   *   - cut 1 through chord midpoint M
+   *   - cut 2 through M shifted toward chosen side by 0.5*|p1-p2|
+   * and (when possible) on the side away from host/body ref.
+   */
+  const planNestArcApexLayout = (
+    f: Figure,
+    name: string,
+    p1: string,
+    p2: string,
+    refToken: string | null,
+    tryIdx: number,
+    forceShortBound = false
+  ): NestArcApexPlan | null => {
+    if (explicitPointLineNames.has(name) && f.has(name)) return null;
+    const P1 = f.pt(p1);
+    const P2 = f.pt(p2);
+    const dx = P2.x - P1.x;
+    const dy = P2.y - P1.y;
+    const L = Math.hypot(dx, dy) || 1;
+    const ux = dx / L;
+    const uy = dy / L;
+    const mx = (P1.x + P2.x) / 2;
+    const my = (P1.y + P2.y) / 2;
+    const seedKey =
+      tryIdx === 0
+        ? `${name}|${p1}|${p2}|nestArc`
+        : `${name}|${p1}|${p2}|nestArc|try${tryIdx}`;
+    const rng = mulberry32(seedFor(seedKey));
+    const useP2Center = rng() < 0.5;
+    const sideLabel: "LEFT" | "RIGHT" = useP2Center ? "RIGHT" : "LEFT";
+    const centerName = useP2Center ? p2 : p1;
+    const C = useP2Center ? P2 : P1;
+    const sideSign = useP2Center ? 1 : -1;
+    const maxAlong =
+      (forceShortBound
+        ? NEST_ARC_LIMIT_FROM_MID_FRAC_NO_REF
+        : refToken !== null
+        ? NEST_ARC_LIMIT_FROM_MID_FRAC_WITH_REF
+        : NEST_ARC_LIMIT_FROM_MID_FRAC_NO_REF) * L;
+    const limitBase = {
+      x: mx + ux * (sideSign * maxAlong),
+      y: my + uy * (sideSign * maxAlong),
+    };
+    let awaySign = 1;
+    if (refToken !== null) {
+      const refNm = resolveRefOn(f, refToken);
+      const R = f.pt(refNm);
+      const crossRef = crossProdZ(P1, P2, R);
+      // Prefer the side opposite to host/body.
+      awaySign = crossRef >= 0 ? -1 : 1;
+    }
+
+    const sampleP = (theta: number): Point => ({
+      x: C.x + L * Math.cos(theta),
+      y: C.y + L * Math.sin(theta),
+    });
+    const circlePolyline: Point[] = [];
+    const nCircle = 96;
+    for (let i = 0; i <= nCircle; i++) {
+      const theta = (i / nCircle) * Math.PI * 2;
+      circlePolyline.push(sampleP(theta));
+    }
+    const isCandidate = (P: Point): boolean => {
+      const along = (P.x - mx) * ux + (P.y - my) * uy;
+      const signed = sideSign * along;
+      if (!(signed >= -1e-6 && signed <= maxAlong + 1e-6)) return false;
+      const cross = crossProdZ(P1, P2, P);
+      return awaySign * cross >= -1e-6;
+    };
+
+    const nSeg = 720;
+    const flags: boolean[] = [];
+    for (let i = 0; i < nSeg; i++) {
+      flags.push(isCandidate(sampleP((i / nSeg) * Math.PI * 2)));
+    }
+    let bestStart = 0;
+    let bestLen = 0;
+    for (let s = 0; s < nSeg; s++) {
+      let len = 0;
+      for (let j = 0; j < nSeg; j++) {
+        if (!flags[(s + j) % nSeg]!) break;
+        len++;
+      }
+      if (len > bestLen) {
+        bestLen = len;
+        bestStart = s;
+      }
+    }
+
+    const arcPolyline: Point[] = [];
+    if (bestLen >= 2) {
+      const nArc = 56;
+      for (let k = 0; k <= nArc; k++) {
+        const t = k / nArc;
+        const idx = bestStart + t * (bestLen - 1);
+        const theta = ((idx % nSeg) / nSeg) * Math.PI * 2;
+        arcPolyline.push(sampleP(theta));
+      }
+    }
+    if (arcPolyline.length < 2) {
+      // Deterministic fallback so step-through still shows a valid segment.
+      const th0 = Math.atan2(my - C.y, mx - C.x);
+      const th1 = Math.atan2(limitBase.y - C.y, limitBase.x - C.x);
+      arcPolyline.push(sampleP(th0), sampleP((th0 + th1) * 0.5), sampleP(th1));
+    }
+
+    const tickLen = Math.min(0.11 * L, 20);
+    const bx = -uy;
+    const by = ux;
+    const bisectorTick: HelperSegmentSpec = {
+      a: { x: mx - bx * tickLen, y: my - by * tickLen },
+      b: { x: mx + bx * tickLen, y: my + by * tickLen },
+    };
+
+    const limitTick: HelperSegmentSpec = {
+      a: { x: limitBase.x - bx * tickLen, y: limitBase.y - by * tickLen },
+      b: { x: limitBase.x + bx * tickLen, y: limitBase.y + by * tickLen },
+    };
+
+    const best = arcPolyline[Math.floor(rng() * arcPolyline.length)] ?? arcPolyline[0]!;
+    const wasMirrored = false;
+    return {
+      sideLabel,
+      centerName,
+      centerPoint: C,
+      circlePolyline,
+      arcPolyline,
+      bisectorTicks: [bisectorTick, limitTick],
+      apex: best,
+      wasMirrored,
+    };
+  };
+
+  /**
+   * Nest apex mode **2**: pick LEFT/RIGHT side and place apex on the constrained
+   * guide arc returned by {@link planNestArcApexLayout}. No post-mirror is
+   * applied, so the apex remains exactly on the chosen circle.
+   */
+  const computeNestArcApexOnFigure = (
+    f: Figure,
+    name: string,
+    p1: string,
+    p2: string,
+    refToken: string | null,
+    tryIdx: number,
+    forceShortBound = false
+  ) => {
+    const plan = planNestArcApexLayout(
+      f,
+      name,
+      p1,
+      p2,
+      refToken,
+      tryIdx,
+      forceShortBound
+    );
+    if (plan) f.point(name, plan.apex);
   };
 
   /** Same geometry as nest `placePerpAwayFrom` `apply`, without `pushStep` (nest layout retries). */
@@ -1024,6 +1386,49 @@ export function parse(
     );
   };
 
+  /** Dispatches nest apex geometry per {@link nestApexPlacementMode}. */
+  const computeNestApexOnFigure = (
+    f: Figure,
+    name: string,
+    p1: string,
+    p2: string,
+    refToken: string | null,
+    tryIdx: number,
+    forceShortBound = false
+  ) => {
+    if (explicitPointLineNames.has(name) && f.has(name)) return;
+    if (nestApexPlacementMode() === 2) {
+      computeNestArcApexOnFigure(
+        f,
+        name,
+        p1,
+        p2,
+        refToken,
+        tryIdx,
+        forceShortBound
+      );
+      // Safety net: if the mode-2 arc pick lands inside existing opaque tube/spike
+      // regions, fall back to mode-1 geometry so nesting can still continue.
+      if (
+        !forceShortBound &&
+        f.has(name) &&
+        f.isPointInsideAnyFilledRegion(f.pt(name))
+      ) {
+        if (refToken !== null) {
+          computeNestPerpAwayFromOnFigure(f, name, p1, p2, refToken, tryIdx);
+        } else {
+          computeNestApexRandomLrOnFigure(f, name, p1, p2, tryIdx);
+        }
+      }
+      return;
+    }
+    if (refToken !== null) {
+      computeNestPerpAwayFromOnFigure(f, name, p1, p2, refToken, tryIdx);
+    } else {
+      computeNestApexRandomLrOnFigure(f, name, p1, p2, tryIdx);
+    }
+  };
+
   /** Counter so `myShape` / `nest` can mint unique helper-point names per call. */
   let shapeCounter = 0;
   /**
@@ -1054,6 +1459,7 @@ export function parse(
       q2: string;
       dir: "in" | "out";
       refPointName: string;
+      legFlip: "p1" | "p2" | null;
     }
   >();
 
@@ -1221,8 +1627,19 @@ export function parse(
     const G = `_ms${id}_G${suf}`;
     const X = `_ms${id}_X${suf}`;
     const Y = `_ms${id}_Y${suf}`;
+    nextTriCounter += 1;
+    const triIdx = nextTriCounter;
+    const TaName = `T${triIdx}a`;
+    const TbName = `T${triIdx}b`;
+    const TcName = `T${triIdx}c`;
+    let legFlip: "p1" | "p2" | null = null;
+    if (nestApexPlacementMode() === 2) {
+      const rng = mulberry32(seedFor(`${TcName}|${TaName}|${TbName}|nestArc`));
+      const useP2Center = rng() < 0.5; // RIGHT when true, LEFT when false
+      legFlip = useP2Center ? "p2" : "p1";
+    }
     emitBlade(a, b, F, G, "in", bodyName);
-    emitSpike(F, G, X, Y, "out", bodyName);
+    emitSpike(F, G, X, Y, "out", bodyName, legFlip);
 
     if (opts?.skipAnchors) return;
 
@@ -1233,11 +1650,9 @@ export function parse(
       q2: Y,
       dir: "out" as const,
       refPointName: bodyName,
+      legFlip,
     };
-
-    nextTriCounter += 1;
-    const triIdx = nextTriCounter;
-    const triPair = { p1: `T${triIdx}a`, p2: `T${triIdx}b` };
+    const triPair = { p1: TaName, p2: TbName };
     if (continuationAnchorSink) {
       continuationAnchorSink(triPair);
     } else if (nestContinuationMax() > 0) {
@@ -1251,8 +1666,6 @@ export function parse(
         const Yp = f.pt(Y);
         const dx = Yp.x - Xp.x;
         const dy = Yp.y - Xp.y;
-        const TaName = `T${triIdx}a`;
-        const TbName = `T${triIdx}b`;
         f.point(TaName, { x: Xp.x - k * dx, y: Xp.y - k * dy });
         f.point(TbName, { x: Yp.x + k * dx, y: Yp.y + k * dy });
         nestAnchorHostBody.set(TaName, bodyName);
@@ -1367,7 +1780,7 @@ export function parse(
       }
     );
 
-    const dCh = constOr("distance");
+    const dCh = distanceFrac();
     const k = dCh / (1 - 2 * dCh);
 
     pushStep(
@@ -1402,21 +1815,11 @@ export function parse(
       );
     }
 
-    pushStep(
-      `nest: shared base inward arc ${p1}–${p2} (opposite signed bend −bOut vs outward; bigBend scale)`,
-      [{ from: p1, to: p2 }],
-      (f) => {
-        const refNm = hostRef ?? bodyName;
-        const bOut = nestSharedBaseOutBend(f, refNm);
-        f.arc(p1, p2, { bend: -bOut, style });
-      }
-    );
-
     const tubeSpec =
       nestAnchorHostTubeReplay.get(p1) ?? nestAnchorHostTubeReplay.get(p2);
     if (tubeSpec) {
       pushStep(
-        `nest: repaint host tube — opaque interior then **side+cap arcs on top** (same order as spike/tube so fill does not halve visible stroke width)`,
+        `nest: repaint host tube — occlusion/mask pass only (direction decided at creation)`,
         [
           { from: tubeSpec.p1, to: tubeSpec.q1 },
           { from: tubeSpec.q1, to: tubeSpec.q2 },
@@ -1424,39 +1827,112 @@ export function parse(
         ],
         (f) => {
           const refNm = resolveRefOn(f, tubeSpec.refPointName);
-          emitTubeRegionOnly(
+          const leg = Math.abs(constOr("tubeBend"));
+          let sb1 = resolveSignedBend(
+            f.pt(tubeSpec.p1),
+            f.pt(tubeSpec.q1),
+            f.pt(refNm),
+            tubeSpec.dir,
+            leg
+          );
+          let sb2 = resolveSignedBend(
+            f.pt(tubeSpec.p2),
+            f.pt(tubeSpec.q2),
+            f.pt(refNm),
+            tubeSpec.dir,
+            leg
+          );
+          if (tubeSpec.legFlip === "p1") sb1 = -sb1;
+          if (tubeSpec.legFlip === "p2") sb2 = -sb2;
+          const sbCap = resolveSignedBend(
+            f.pt(tubeSpec.q1),
+            f.pt(tubeSpec.q2),
+            f.pt(refNm),
+            tubeSpec.dir,
+            constOr("smallBend")
+          );
+          emitTubeRegionFromSignedBends(
             f,
             tubeSpec.p1,
             tubeSpec.p2,
             tubeSpec.q1,
             tubeSpec.q2,
-            tubeSpec.dir,
-            refNm
+            sb1,
+            sb2,
+            sbCap
           );
-          emitTubeArcP1Q1(
-            f,
-            tubeSpec.p1,
-            tubeSpec.q1,
-            tubeSpec.dir,
-            refNm
-          );
-          emitTubeArcP2Q2(
-            f,
-            tubeSpec.p2,
-            tubeSpec.q2,
-            tubeSpec.dir,
-            refNm
-          );
-          emitTubeCapQ1Q2(
-            f,
-            tubeSpec.q1,
-            tubeSpec.q2,
-            tubeSpec.dir,
-            refNm
-          );
+          f.arc(tubeSpec.p1, tubeSpec.q1, { bend: sb1, style });
+          f.arc(tubeSpec.p2, tubeSpec.q2, { bend: sb2, style });
+          f.arc(tubeSpec.q1, tubeSpec.q2, { bend: sbCap, style });
         }
       );
     }
+
+    pushStep(
+      `nest: shared base inward arc ${p1}–${p2} (opposite signed bend −bOut vs outward; bigBend scale), then clip behind host tube`,
+      [{ from: p1, to: p2 }],
+      (f) => {
+        const refNm = hostRef ?? bodyName;
+        const bOut = nestSharedBaseOutBend(f, refNm);
+        f.arc(p1, p2, { bend: -bOut, style });
+        if (tubeSpec) {
+          const tubeRef = resolveRefOn(f, tubeSpec.refPointName);
+          const oldLegMag = Math.abs(constOr("tubeBend"));
+          const oldSb1 = resolveSignedBend(
+            f.pt(tubeSpec.p1),
+            f.pt(tubeSpec.q1),
+            f.pt(tubeRef),
+            tubeSpec.dir,
+            oldLegMag
+          );
+          const oldSb2 = resolveSignedBend(
+            f.pt(tubeSpec.p2),
+            f.pt(tubeSpec.q2),
+            f.pt(tubeRef),
+            tubeSpec.dir,
+            oldLegMag
+          );
+          const apexPt = f.pt(p3);
+          const A1 = f.pt(p1);
+          const A2 = f.pt(p2);
+          const apexFoot = footOnLineThrough(A1, A2, apexPt);
+          const distToP1 = distance(apexFoot, A1);
+          const distToP2 = distance(apexFoot, A2);
+          const flipLeg1 = distToP1 <= distToP2;
+          const sb1 = flipLeg1 ? -oldSb1 : oldSb1;
+          const sb2 = flipLeg1 ? oldSb2 : -oldSb2;
+          const sbCap = resolveSignedBend(
+            f.pt(tubeSpec.q1),
+            f.pt(tubeSpec.q2),
+            f.pt(tubeRef),
+            tubeSpec.dir,
+            constOr("smallBend")
+          );
+          // Final mask pass: hide shared-base arc segments that run through tube interior.
+          emitTubeRegionFromSignedBends(
+            f,
+            tubeSpec.p1,
+            tubeSpec.p2,
+            tubeSpec.q1,
+            tubeSpec.q2,
+            sb1,
+            sb2,
+            sbCap
+          );
+          // Re-draw tube boundaries after mask so contour remains crisp.
+          f.arc(tubeSpec.p1, tubeSpec.q1, { bend: sb1, style });
+          f.arc(tubeSpec.p2, tubeSpec.q2, { bend: sb2, style });
+          f.arc(tubeSpec.q1, tubeSpec.q2, { bend: sbCap, style });
+          // Seal the host tube base seam after leg-direction changes.
+          f.arc(tubeSpec.p1, tubeSpec.p2, {
+            bend: constOr("smallBend"),
+            dir: "in",
+            ref: tubeSpec.refPointName,
+            style,
+          });
+        }
+      }
+    );
   };
 
   type NestTubeReplayEntry = {
@@ -1466,6 +1942,7 @@ export function parse(
     q2: string;
     dir: "in" | "out";
     refPointName: string;
+    legFlip: "p1" | "p2" | null;
   };
 
   type ParseLayoutCheckpoint = {
@@ -1827,7 +2304,7 @@ export function parse(
             }
           );
 
-          const dCh = constOr("distance");
+          const dCh = distanceFrac();
           const k = dCh / (1 - 2 * dCh);
 
           const edges: Array<[string, string, "in" | "out", string]> = [
@@ -1867,24 +2344,15 @@ export function parse(
                       p3: p3a,
                       nextWave,
                       placeApexSilent: (tryIdx) => {
-                        if (hostBody) {
-                          computeNestPerpAwayFromOnFigure(
-                            fig,
-                            p3a,
-                            na,
-                            nb,
-                            hostBody,
-                            tryIdx
-                          );
-                        } else {
-                          computeNestApexRandomLrOnFigure(
-                            fig,
-                            p3a,
-                            na,
-                            nb,
-                            tryIdx
-                          );
-                        }
+                        computeNestApexOnFigure(
+                          fig,
+                          p3a,
+                          na,
+                          nb,
+                          hostBody ?? null,
+                          tryIdx,
+                          pass === passMax - 1
+                        );
                       },
                       nestUserScriptedMeta: undefined,
                       stepNotePrefix: stepPf,
@@ -2000,18 +2468,14 @@ export function parse(
                 p3,
                 nextWave: null,
                 placeApexSilent: (tryIdx) => {
-                  if (hostBody) {
-                    computeNestPerpAwayFromOnFigure(
-                      fig,
-                      p3,
-                      p1,
-                      p2,
-                      hostBody,
-                      tryIdx
-                    );
-                  } else {
-                    computeNestApexRandomLrOnFigure(fig, p3, p1, p2, tryIdx);
-                  }
+                  computeNestApexOnFigure(
+                    fig,
+                    p3,
+                    p1,
+                    p2,
+                    hostBody ?? null,
+                    tryIdx
+                  );
                 },
                 implicitPush: (d13r, d23r) => {
                   implicitNestApexes.push({
@@ -2087,14 +2551,7 @@ export function parse(
                 p3,
                 nextWave: null,
                 placeApexSilent: (tryIdx) => {
-                  computeNestPerpAwayFromOnFigure(
-                    fig,
-                    p3,
-                    p1,
-                    p2,
-                    refTok,
-                    tryIdx
-                  );
+                  computeNestApexOnFigure(fig, p3, p1, p2, refTok, tryIdx);
                 },
                 implicitPush: (d13r, d23r) => {
                   implicitNestApexes.push({
@@ -2194,14 +2651,7 @@ export function parse(
                 p3,
                 nextWave: null,
                 placeApexSilent: (tryIdx) => {
-                  computeNestPerpAwayFromOnFigure(
-                    fig,
-                    p3,
-                    p1,
-                    p2,
-                    refTok,
-                    tryIdx
-                  );
+                  computeNestApexOnFigure(fig, p3, p1, p2, refTok, tryIdx);
                 },
                 nestUserScriptedMetaFn: (r) => ({
                   d13: u13b,

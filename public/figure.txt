@@ -23,11 +23,13 @@ const topDisplacement     40
 const bigBend        0.24
 const smallBend      0.16
 const tubeBend       0.06
-const distance       0.20
+const distance       20
 
 # Nest apex / auto-nest: re-pick apex when an apex lands inside an already filled area.
 const nestLayoutMaxAttempts 8
 const doubleInnProbability 30
+
+const nestApexPlacement 2
 
 # After each `myShape`, N batch passes: each pass nests every open T*a/T*b pair from the previous wave.
 const nestContinuations 3

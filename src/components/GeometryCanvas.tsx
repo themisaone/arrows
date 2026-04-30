@@ -88,6 +88,57 @@ function renderHelperLines(
   });
 }
 
+/** Named-point chords (gray) plus optional arc polylines / ticks / upcoming dots for nest apex option 2. */
+function renderStepThroughHelperOverlays(
+  fig: FigureType,
+  step: BuildStep,
+  keyPrefix: string
+): React.ReactNode {
+  return (
+    <g pointerEvents="none">
+      {renderHelperLines(fig, step.helperLines, keyPrefix)}
+      {step.helperPolylines?.map((pl, i) =>
+        pl.points.length >= 2 ? (
+          <polyline
+            key={`${keyPrefix}-pl-${i}`}
+            fill="none"
+            stroke={pl.stroke ?? "#a21caf"}
+            strokeWidth={pl.strokeWidth ?? 2}
+            strokeLinejoin="round"
+            strokeLinecap="round"
+            points={pl.points.map((p) => `${p.x},${p.y}`).join(" ")}
+            opacity={0.95}
+          />
+        ) : null
+      )}
+      {step.helperSegments?.map((s, i) => (
+        <line
+          key={`${keyPrefix}-seg-${i}`}
+          x1={s.a.x}
+          y1={s.a.y}
+          x2={s.b.x}
+          y2={s.b.y}
+          stroke="#64748b"
+          strokeWidth={1.6}
+          strokeDasharray="4 3"
+          opacity={0.92}
+        />
+      ))}
+      {step.helperDots?.map((p, i) => (
+        <circle
+          key={`${keyPrefix}-dot-${i}`}
+          cx={p.x}
+          cy={p.y}
+          r={5}
+          fill="#059669"
+          stroke="#ecfdf5"
+          strokeWidth={1.5}
+        />
+      ))}
+    </g>
+  );
+}
+
 const GeometryCanvas: React.FC = () => {
   const [script, setScript] = useState<string>(
     () => localStorage.getItem(STORAGE_KEY) ?? ""
@@ -553,9 +604,9 @@ const GeometryCanvas: React.FC = () => {
               <g className="no-draw-animate">{miniPreviewNode}</g>
               {stepThrough &&
                 nextStepPreview &&
-                renderHelperLines(
+                renderStepThroughHelperOverlays(
                   displayFigure,
-                  nextStepPreview.helperLines,
+                  nextStepPreview,
                   helperKey
                 )}
               {showDragHandles &&
