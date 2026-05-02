@@ -1,41 +1,61 @@
-# ====================================================================
+# ==========================================================
 # Figure script. Loaded into the textarea on first load.
 # Edit live in the app; press Reset to restore this default.
-# ====================================================================
+# ==========================================================
 
-# --------------------------------------------------------------------
-# Scale & bands (percent spans are half-widths: 20 => 80%..120% of center)
-# --------------------------------------------------------------------
-
-# Average length of distance in shape-triangles
+# -------------------------------
+# Average length of distance in 
+# shape-triangles and percentage
+# in variation
+# -------------------------------
 const averageSize         80
-## Percentage in variation (meaning: from 120 - 180)
 const averageSpan         20
 
-# Average height of tube  (50% of size above)
+# -------------------------------
+# Average height of tube  
+# percentage in variation 
+# and fixed percentage of the
+# tube point from blade corner
+# -------------------------------
 const tubeAverageHeight   36
-## Percentage in variation (meaning: from 80 - 120)
 const tubeAverageSpan     20
+const distance       20
 
-const topDisplacement     40
-
+# -------------------------------
 # Bends (dimensionless)
+# -------------------------------
 const bigBend        0.24
 const smallBend      0.16
 const tubeBend       0.06
-const distance       20
 
-# Nest apex / auto-nest: re-pick apex when an apex lands inside an already filled area.
+# -------------------------------
+# Nest apex / auto-nest: 
+# re-pick apex when an apex lands 
+# inside an already filled area.
+# -------------------------------
 const nestLayoutMaxAttempts 8
+
+# -------------------------------
+# Probability of creating
+# shape with 'diuble' innwards
+# -------------------------------
 const doubleInnProbability 30
 
-const nestApexPlacement 2
-
-# After each `myShape`, N batch passes: each pass nests every open T*a/T*b pair from the previous wave.
+# -------------------------------
+# After each `myShape`, N batch 
+# passes: each pass nests every 
+# open T*a/T*b pair from the 
+# previous wave.
+# Note! Last pass (when N≥2): 
+# rim-only “arrow” tips — no 
+# blade/tube. `const continuationEndArrow 0` 
+# keeps full tubes on every pass.
+# -------------------------------
 const nestContinuations 3
-# Last pass (when N≥2): rim-only “arrow” tips — no blade/tube. `const continuationEndArrow 0` keeps full tubes on every pass.
 
-# Compact layout for nesting several shapes on one page
+# -------------------------------
+# Script, initial points given
+# -------------------------------
 point A 500 300
 point B 480 380
 point C 580 350

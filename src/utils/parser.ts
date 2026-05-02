@@ -62,21 +62,11 @@ import {
  *                                      # inside an already-filled region (tube/spike area).
  *                                      # Default **12**. Emits soft {@link ParseResult.infos}
  *                                      # lines for retries / skipped branches.
- *   const nestApexPlacement 1|2       # optional. **1** (default): nest apex = midpoint
- *                                      # of anchor chord, ⊥ offset away from host/ref
- *                                      # (same bands as `perp`) + parallel slide along chord.
- *                                      # **2**: choose LEFT/RIGHT (toward first/second anchor
- *                                      # along the chord), then place apex on a guide arc that
- *                                      # starts at chord midpoint, stays on the opposite side
- *                                      # of the anchor chord line, and ends half-chord beyond
- *                                      # the selected anchor; with a host/ref, may
- *                                      # mirror across the chord like mode **1** so the apex
- *                                      # stays on the tube-opening side. With **Step-through**
- *                                      # on, mode **2** splits into three UI steps: **LEFT** /
- *                                      # **RIGHT** (toward first vs second anchor along the
- *                                      # chord), then a magenta preview of the admissible arc
- *                                      # plus a short gray ⊥ bisector tick at the midpoint,
- *                                      # then placing the apex on the arc.
+ *   const nestApexPlacement 2         # (kept for backward compatibility; nesting now
+ *                                      # always uses arc-based Option 2)
+ *                                      # choose LEFT/RIGHT (toward first/second anchor
+ *                                      # along the chord), then place apex on a constrained
+ *                                      # arc on the deciding circle.
  *   const doubleInnProbability P       # optional percent (0..100). For inferred/auto
  *                                      # nests only: when apex projection on p1-p2 is
  *                                      # within 50% of chord length from the midpoint,
@@ -564,24 +554,6 @@ export function parse(
     return 12;
   };
 
-  /**
-   * **1** — perpendicular from chord midpoint (same as `perp` nest path).
-   * **2** — choose LEFT/RIGHT and place apex on a constrained guide arc:
-   * from chord midpoint to half-chord beyond the selected anchor, on the
-   * opposite side of the anchor chord line.
-   */
-  const nestApexPlacementMode = (): 1 | 2 => {
-    const keys = ["nestApexPlacement", "apexPlacement", "nestApexPlacementOption"];
-    for (const k of keys) {
-      if (consts.has(k)) {
-        const v = Math.floor(consts.get(k)!);
-        if (v === 2) return 2;
-        return 1;
-      }
-    }
-    return 1;
-  };
-
   /** Percent chance (0..100) to force inferred/auto nests to `in`+`in` near midpoint. */
   const doubleInnProbabilityPct = (): number => {
     if (!consts.has("doubleInnProbability")) return 0;
@@ -940,7 +912,7 @@ export function parse(
         );
         return;
       }
-      if (nestApexPlacementMode() === 2 && stepped) {
+      if (stepped) {
         const plan = planNestArcApexLayout(fig, name, p1, p2, refToken, 0);
         if (plan) {
           pushStep(
@@ -984,9 +956,7 @@ export function parse(
 
     const stepMsg =
       stepKind === "nest"
-        ? nestApexPlacementMode() === 2
-          ? `nest: place apex ${name} — arc (center ${p1}|${p2}, r=|${p1}–${p2}|) past ⊥ bisector, away-from-body mirror (${refToken})`
-          : `nest: place apex ${name} — ⊥ from ${p1}–${p2} midpoint away from host body (${refToken}), same bands as perp`
+        ? `nest: place apex ${name} — constrained arc on circle from ${p1}|${p2} (${refToken})`
         : `perp ${name}: from chord ${p1}–${p2} midpoint, offset ⊥ by averageSize±averageSpan%, then parallel slide ≤ ${topDispPct()}% of averageSize along chord (away from ref ${refToken})`;
     pushStep(stepMsg, chordHL, (f) => {
         if (stepKind === "nest" && explicitPointLineNames.has(name) && f.has(name)) {
@@ -1047,7 +1017,6 @@ export function parse(
    */
   const placeNestApexRandomLr = (name: string, p1: string, p2: string) => {
     const chordHL: HelperLineSpec[] = [{ from: p1, to: p2 }];
-    const mode2 = nestApexPlacementMode() === 2;
     if (explicitPointLineNames.has(name) && fig.has(name)) {
       pushStep(
         `nest: apex ${name} already explicit — skip auto placement`,
@@ -1056,7 +1025,7 @@ export function parse(
       );
       return;
     }
-    if (mode2 && stepped) {
+    if (stepped) {
       const plan = planNestArcApexLayout(fig, name, p1, p2, null, 0);
       if (plan) {
         pushStep(
@@ -1089,60 +1058,13 @@ export function parse(
       }
     }
     pushStep(
-      mode2
-        ? `nest: place apex ${name} — arc (center ${p1}|${p2}, r=chord); anchors had no host body`
-        : `nest: place apex ${name} — random L/R ⊥ from ${p1}–${p2} midpoint (anchors had no host body; same bands as perp)`,
+      `nest: place apex ${name} — constrained arc on circle from ${p1}|${p2} (anchors had no host body)`,
       chordHL,
       (f) => {
         if (explicitPointLineNames.has(name) && f.has(name)) return;
         computeNestApexOnFigure(f, name, p1, p2, null, 0);
       }
     );
-  };
-
-  /** Same geometry as {@link placeNestApexRandomLr} `apply`, without `pushStep` (nest layout retries). */
-  const computeNestApexRandomLrOnFigure = (
-    f: Figure,
-    name: string,
-    p1: string,
-    p2: string,
-    tryIdx: number
-  ) => {
-    if (explicitPointLineNames.has(name) && f.has(name)) return;
-    const P1 = f.pt(p1);
-    const P2 = f.pt(p2);
-    const dx = P2.x - P1.x;
-    const dy = P2.y - P1.y;
-    const len = Math.hypot(dx, dy) || 1;
-    const ux = dx / len;
-    const uy = dy / len;
-    let nx = -dy / len;
-    let ny = dx / len;
-    const mx = (P1.x + P2.x) / 2;
-    const my = (P1.y + P2.y) / 2;
-    const seedKey =
-      tryIdx === 0
-        ? `${name}|${p1}|${p2}|nestLR`
-        : `${name}|${p1}|${p2}|nestLR|try${tryIdx}`;
-    const rng = mulberry32(seedFor(seedKey));
-    if (rng() < 0.5) {
-      nx = -nx;
-      ny = -ny;
-    }
-    let h: number;
-    if (consts.has("tubeHeightLow") && consts.has("tubeHeightHigh")) {
-      const lo = consts.get("tubeHeightLow")!;
-      const hi = consts.get("tubeHeightHigh")!;
-      h = lo + rng() * (hi - lo);
-    } else {
-      h = spanBand(avgSize(), avgSpanPct(), rng);
-    }
-    const maxPar = (topDispPct() / 100) * avgSize();
-    const t = (2 * rng() - 1) * maxPar;
-    f.point(name, {
-      x: mx + nx * h + ux * t,
-      y: my + ny * h + uy * t,
-    });
   };
 
   /**
@@ -1331,62 +1253,7 @@ export function parse(
     if (plan) f.point(name, plan.apex);
   };
 
-  /** Same geometry as nest `placePerpAwayFrom` `apply`, without `pushStep` (nest layout retries). */
-  const computeNestPerpAwayFromOnFigure = (
-    f: Figure,
-    name: string,
-    p1: string,
-    p2: string,
-    refToken: string,
-    tryIdx: number
-  ) => {
-    if (explicitPointLineNames.has(name) && f.has(name)) return;
-    const refNm = resolveRefOn(f, refToken);
-    const P1 = f.pt(p1);
-    const P2 = f.pt(p2);
-    const R = f.pt(refNm);
-    const dx = P2.x - P1.x;
-    const dy = P2.y - P1.y;
-    const len = Math.hypot(dx, dy) || 1;
-    const ux = dx / len;
-    const uy = dy / len;
-    let nx = -dy / len;
-    let ny = dx / len;
-    const mx = (P1.x + P2.x) / 2;
-    const my = (P1.y + P2.y) / 2;
-    const towardRef = nx * (R.x - mx) + ny * (R.y - my);
-    if (towardRef > 0) {
-      nx = -nx;
-      ny = -ny;
-    }
-    const seedKey = tryIdx === 0 ? name : `${name}|try${tryIdx}`;
-    const rng = mulberry32(seedFor(seedKey));
-    let h: number;
-    if (consts.has("tubeHeightLow") && consts.has("tubeHeightHigh")) {
-      const lo = consts.get("tubeHeightLow")!;
-      const hi = consts.get("tubeHeightHigh")!;
-      h = lo + rng() * (hi - lo);
-    } else {
-      h = spanBand(avgSize(), avgSpanPct(), rng);
-    }
-    const maxPar = (topDispPct() / 100) * avgSize();
-    const t = (2 * rng() - 1) * maxPar;
-    const cand = {
-      x: mx + nx * h + ux * t,
-      y: my + ny * h + uy * t,
-    };
-    const ch = crossProdZ(P1, P2, R);
-    const ca = crossProdZ(P1, P2, cand);
-    const mustMirror = Math.abs(ch) > 1e-9 && ch * ca > 0;
-    f.point(
-      name,
-      mustMirror
-        ? { x: mx - nx * h + ux * t, y: my - ny * h + uy * t }
-        : cand
-    );
-  };
-
-  /** Dispatches nest apex geometry per {@link nestApexPlacementMode}. */
+  /** Nest apex placement: always constrained circle-arc (Option 2). */
   const computeNestApexOnFigure = (
     f: Figure,
     name: string,
@@ -1397,36 +1264,7 @@ export function parse(
     forceShortBound = false
   ) => {
     if (explicitPointLineNames.has(name) && f.has(name)) return;
-    if (nestApexPlacementMode() === 2) {
-      computeNestArcApexOnFigure(
-        f,
-        name,
-        p1,
-        p2,
-        refToken,
-        tryIdx,
-        forceShortBound
-      );
-      // Safety net: if the mode-2 arc pick lands inside existing opaque tube/spike
-      // regions, fall back to mode-1 geometry so nesting can still continue.
-      if (
-        !forceShortBound &&
-        f.has(name) &&
-        f.isPointInsideAnyFilledRegion(f.pt(name))
-      ) {
-        if (refToken !== null) {
-          computeNestPerpAwayFromOnFigure(f, name, p1, p2, refToken, tryIdx);
-        } else {
-          computeNestApexRandomLrOnFigure(f, name, p1, p2, tryIdx);
-        }
-      }
-      return;
-    }
-    if (refToken !== null) {
-      computeNestPerpAwayFromOnFigure(f, name, p1, p2, refToken, tryIdx);
-    } else {
-      computeNestApexRandomLrOnFigure(f, name, p1, p2, tryIdx);
-    }
+    computeNestArcApexOnFigure(f, name, p1, p2, refToken, tryIdx, forceShortBound);
   };
 
   /** Counter so `myShape` / `nest` can mint unique helper-point names per call. */
@@ -1633,11 +1471,9 @@ export function parse(
     const TbName = `T${triIdx}b`;
     const TcName = `T${triIdx}c`;
     let legFlip: "p1" | "p2" | null = null;
-    if (nestApexPlacementMode() === 2) {
-      const rng = mulberry32(seedFor(`${TcName}|${TaName}|${TbName}|nestArc`));
-      const useP2Center = rng() < 0.5; // RIGHT when true, LEFT when false
-      legFlip = useP2Center ? "p2" : "p1";
-    }
+    const rng = mulberry32(seedFor(`${TcName}|${TaName}|${TbName}|nestArc`));
+    const useP2Center = rng() < 0.5; // RIGHT when true, LEFT when false
+    legFlip = useP2Center ? "p2" : "p1";
     emitBlade(a, b, F, G, "in", bodyName);
     emitSpike(F, G, X, Y, "out", bodyName, legFlip);
 
