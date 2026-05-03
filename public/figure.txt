@@ -51,15 +51,24 @@ const doubleInnProbability 30
 # blade/tube. `const continuationEndArrow 0` 
 # keeps full tubes on every pass.
 # -------------------------------
-const nestContinuations 3
+const nestContinuations   4
 
 # -------------------------------
 # Script, initial points given
 # -------------------------------
+# point A 500 300
+# point B 480 380
+# point C 580 350
+
+# myShape A B C out in in
+
+# dot A B C
+
 point A 500 300
 point B 480 380
-point C 580 350
 
-myShape A B C out in in
+evolve A B
 
-dot A B C
+dot A B
+
+

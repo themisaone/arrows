@@ -22,7 +22,7 @@ import {
 /**
  * Tiny text DSL for building a Figure.
  *
- *   const NAME VALUE                  # numeric constant, usable below
+ *   const NAME VALUE                  # numeric constant, usable below (`true`/`false` → 1/0)
  *   const averageSize N               # typical chord / layout scale in px
  *                                      # (default 160). Used as the center for
  *                                      # `perp` perpendicular offset (unless
@@ -104,6 +104,13 @@ import {
  *                                      # Randomness is
  *                                      # seeded by "Q1|Q2" so it stays stable
  *                                      # across edits.
+ *   evolve P1 P2                      # From two base points only: random LEFT/RIGHT
+ *                                      # arc apex (same circle rule as nest), place
+ *                                      # auto apex `_evo_P1_P2`, set A–P2 base `in`
+ *                                      # with probability `doubleInnProbability` else `out`,
+ *                                      # set P1–apex / P2–apex to one `in` and one `out`
+ *                                      # via foot-closer chirality, then same triangle +
+ *                                      # continuation pipeline as `myShape`.
  *   myShape P1 P2 P3 d12 d13 d23      # "thorny triangle": for each edge, in
  *                                      # the order P1-P2, P1-P3, P2-P3, dij
  *                                      # describes whether the edge has an
@@ -248,15 +255,28 @@ export type ImplicitNestApexInfo = {
   lineNum: number;
 };
 
+/** `evolve P1 P2` auto apex + modes; see {@link updatePointInScript}. */
+export type ImplicitEvolveApexInfo = {
+  apex: string;
+  p1: string;
+  p2: string;
+  d12: "in" | "out";
+  d13: "in" | "out";
+  d23: "in" | "out";
+  lineNum: number;
+};
+
 export interface ParseResult {
   figure: Figure;
   errors: string[];
   /** Non-fatal notes (e.g. nest apex layout retries). */
   infos?: string[];
-  /** Draggable point names: `point`, `perp`, inferred-apex `nest P1 P2` / `nest P1 P2 REF`. */
+  /** Draggable point names: `point`, `perp`, inferred-apex `nest` / `evolve P1 P2`. */
   freePoints: string[];
   /** Inferred-apex `nest` lines (3- or 4-token); see {@link updatePointInScript}. */
   implicitNestApexes: ImplicitNestApexInfo[];
+  /** `evolve P1 P2` auto apex + edge modes; see {@link updatePointInScript}. */
+  implicitEvolveApexes: ImplicitEvolveApexInfo[];
   /** Present when `parse(..., { stepped: true })`: run each `apply` after Enter. */
   buildSteps?: BuildStep[];
 }
@@ -342,6 +362,14 @@ function resolveSignedBend(
  * If P1/P2 are paired anchors like `T1a` and `T1b` (same prefix, suffix `a`/`b`),
  * returns the inferred apex label `T1c`. Otherwise `null`.
  */
+/**
+ * Auto apex name for `evolve P1 P2` (stable for script scanning / drag rewrite).
+ * Example: `evolve A B` → `_evo_A_B`.
+ */
+export function inferEvolveApexName(p1: string, p2: string): string {
+  return `_evo_${p1}_${p2}`;
+}
+
 export function inferNestApexFromAnchors(p1: string, p2: string): string | null {
   if (p1.length < 2 || p2.length < 2) return null;
   const last1 = p1.slice(-1);
@@ -369,6 +397,8 @@ function scanFreePointNamesFromScript(script: string): string[] {
     } else if (cmd === "nest" && (toks.length === 3 || toks.length === 4)) {
       const apex = inferNestApexFromAnchors(toks[1]!, toks[2]!);
       if (apex) out.push(apex);
+    } else if (cmd === "evolve" && toks.length === 3) {
+      out.push(inferEvolveApexName(toks[1]!, toks[2]!));
     }
   }
   return out;
@@ -410,6 +440,7 @@ export function parse(
   const stepped = options?.stepped ?? false;
   const buildSteps: BuildStep[] = [];
   const implicitNestApexes: ImplicitNestApexInfo[] = [];
+  const implicitEvolveApexes: ImplicitEvolveApexInfo[] = [];
   const scriptLines = script.split("\n");
   const explicitPointLineNames = scanExplicitPointLineNames(script);
   const showMacroHelperLabels = options?.showMacroHelperLabels !== false;
@@ -781,18 +812,7 @@ export function parse(
     refToken: string,
     legFlip: "p1" | "p2" | null = null
   ) => {
-    const rng = mulberry32(seedFor(`${q1}|${q2}`));
-    let d1: number;
-    let d2: number;
-    if (consts.has("tubeHeightLow") && consts.has("tubeHeightHigh")) {
-      const lo = consts.get("tubeHeightLow")!;
-      const hi = consts.get("tubeHeightHigh")!;
-      d1 = lo + rng() * (hi - lo);
-      d2 = lo + rng() * (hi - lo);
-    } else {
-      d1 = randomTubeExtrusion(rng);
-      d2 = randomTubeExtrusion(rng);
-    }
+    const extrusionSeed = seedFor(`${q1}|${q2}`);
 
     pushStep(
       `Spike: resolve ref “${refToken}” (bend reference for chord ${p1}–${p2}, ${dir})`,
@@ -803,29 +823,29 @@ export function parse(
     );
 
     pushStep(
-      `Spike: place tip ${q1} — along ⊥ from ${p1}, offset ${d1.toFixed(1)} px (seed ${q1}|${q2})`,
+      `Spike: place tips ${q1}, ${q2} — along ⊥ from ${p1}/${p2} (tube height ± tubeAverageSpan%; seed ${q1}|${q2})`,
       [{ from: p1, to: p2 }],
       (f) => {
+        const rng = mulberry32(extrusionSeed);
+        let d1: number;
+        let d2: number;
+        if (consts.has("tubeHeightLow") && consts.has("tubeHeightHigh")) {
+          const lo = consts.get("tubeHeightLow")!;
+          const hi = consts.get("tubeHeightHigh")!;
+          d1 = lo + rng() * (hi - lo);
+          d2 = lo + rng() * (hi - lo);
+        } else {
+          d1 = randomTubeExtrusion(rng);
+          d2 = randomTubeExtrusion(rng);
+        }
         const refNm = resolveRefOn(f, refToken);
         const P1 = f.pt(p1);
         const P2 = f.pt(p2);
         const R = f.pt(refNm);
         const { nx, ny } = spikeOutwardNormal(P1, P2, R, dir);
         f.point(q1, { x: P1.x + nx * d1, y: P1.y + ny * d1 });
-        macroVis(f, q1);
-      }
-    );
-
-    pushStep(
-      `Spike: place tip ${q2} — along ⊥ from ${p2}, offset ${d2.toFixed(1)} px`,
-      [{ from: p1, to: p2 }, { from: p1, to: q1 }],
-      (f) => {
-        const refNm = resolveRefOn(f, refToken);
-        const P1 = f.pt(p1);
-        const P2 = f.pt(p2);
-        const R = f.pt(refNm);
-        const { nx, ny } = spikeOutwardNormal(P1, P2, R, dir);
         f.point(q2, { x: P2.x + nx * d2, y: P2.y + ny * d2 });
+        macroVis(f, q1);
         macroVis(f, q2);
       }
     );
@@ -1926,6 +1946,154 @@ export function parse(
     restoreParseCheckpoint(cp, wave);
   };
 
+  /**
+   * Auto-nest continuation waves after a thorny triangle (`myShape` / `evolve`).
+   * Same behavior as the tail of `myShape`.
+   */
+  const runAutoNestContinuationWaves = (stepNotePrefix: string) => {
+    const passMax = nestContinuationMax();
+    if (passMax > 0) {
+      let wave = pendingInAnchors.splice(0, pendingInAnchors.length);
+      for (let pass = 0; pass < passMax && wave.length > 0; pass++) {
+        const nextWave: { p1: string; p2: string }[] = [];
+        continuationAnchorSink = (pair) => {
+          nextWave.push(pair);
+        };
+        try {
+          for (let wi = 0; wi < wave.length; wi++) {
+            const { p1: na, p2: nb } = wave[wi]!;
+            const inferredA = inferNestApexFromAnchors(na, nb);
+            if (!inferredA) continue;
+            const p3a = inferredA;
+            const hostBody =
+              nestAnchorHostBody.get(na) ?? nestAnchorHostBody.get(nb);
+            const arrowTerminal =
+              continuationEndArrow() && passMax > 1 && pass === passMax - 1;
+            const stepPf = `${stepNotePrefix}[auto nest pass ${pass + 1}/${passMax}, pair ${wi + 1}/${wave.length}] `;
+            if (!stepped) {
+              runNestWithApexLayoutRetries({
+                p1: na,
+                p2: nb,
+                p3: p3a,
+                nextWave,
+                placeApexSilent: (tryIdx) => {
+                  computeNestApexOnFigure(
+                    fig,
+                    p3a,
+                    na,
+                    nb,
+                    hostBody ?? null,
+                    tryIdx,
+                    pass === passMax - 1
+                  );
+                },
+                nestUserScriptedMeta: undefined,
+                stepNotePrefix: stepPf,
+                arrowTerminal,
+                label: `Auto nest ${na}–${nb}`,
+                allowDoubleInn: true,
+              });
+            } else {
+              if (hostBody) {
+                placePerpAwayFrom(p3a, na, nb, hostBody, "nest");
+              } else {
+                placeNestApexRandomLr(p3a, na, nb);
+              }
+              freePoints.push(p3a);
+              let da13: "in" | "out" = "out";
+              let da23: "in" | "out" = "in";
+              const rAuto = resolveNestSideSwap(na, nb, p3a, fig);
+              const swapRuleAuto = rAuto.swapRule;
+              if (rAuto.swap) {
+                da13 = "in";
+                da23 = "out";
+              }
+              if (!arrowTerminal) {
+                const mAuto = maybeApplyDoubleInn(
+                  na,
+                  nb,
+                  p3a,
+                  da13,
+                  da23,
+                  `${na}|${nb}|${p3a}|auto`
+                );
+                da13 = mAuto.d13;
+                da23 = mAuto.d23;
+                if (mAuto.applied) {
+                  infos.push(
+                    `Auto nest ${na}–${nb}: doubleInn applied (disp ${mAuto.displacementPct.toFixed(1)}% < 50%).`
+                  );
+                }
+              }
+              emitNestGeometry(
+                na,
+                nb,
+                p3a,
+                da13,
+                da23,
+                undefined,
+                swapRuleAuto,
+                stepPf,
+                arrowTerminal
+              );
+            }
+          }
+        } finally {
+          continuationAnchorSink = null;
+        }
+        wave = nextWave;
+      }
+    } else {
+      pendingInAnchors.length = 0;
+    }
+  };
+
+  /** Body + three edges of a thorny triangle; then optional continuation waves. */
+  const emitThornyTriangle = (
+    p1: string,
+    p2: string,
+    p3: string,
+    d12: "in" | "out",
+    d13: "in" | "out",
+    d23: "in" | "out",
+    stepPrefix: string
+  ) => {
+    const id = ++shapeCounter;
+    const A = fig.pt(p1);
+    const B = fig.pt(p2);
+    const C = fig.pt(p3);
+    const bodyName = `_ms${id}_body`;
+    pushStep(
+      `${stepPrefix}body centroid ${bodyName} = average of ${p1}, ${p2}, ${p3}`,
+      [
+        { from: p1, to: p2 },
+        { from: p2, to: p3 },
+        { from: p3, to: p1 },
+      ],
+      (f) => {
+        f.point(bodyName, {
+          x: (A.x + B.x + C.x) / 3,
+          y: (A.y + B.y + C.y) / 3,
+        });
+        macroVis(f, bodyName);
+      }
+    );
+
+    const dCh = distanceFrac();
+    const k = dCh / (1 - 2 * dCh);
+
+    const edges: Array<[string, string, "in" | "out", string]> = [
+      [p1, p2, d12, "12"],
+      [p1, p3, d13, "13"],
+      [p2, p3, d23, "23"],
+    ];
+    for (const [a, b, mode, suf] of edges) {
+      emitShapeEdge(id, a, b, mode, suf, bodyName, k);
+    }
+
+    runAutoNestContinuationWaves(stepPrefix);
+  };
+
   for (let i = 0; i < scriptLines.length; i++) {
     const lineNum = i + 1;
     const stripped = scriptLines[i]!.replace(/#.*/, "").trim();
@@ -1942,7 +2110,9 @@ export function parse(
             throw new Error("usage: const NAME VALUE");
           }
           const [, name, valStr] = tokens;
-          const v = num(valStr);
+          const lv = valStr.toLowerCase();
+          const v =
+            lv === "true" ? 1 : lv === "false" ? 0 : num(valStr);
           pushStep(`const ${name} = ${v}`, undefined, (_f) => {
             consts.set(name, v);
           });
@@ -2115,139 +2285,211 @@ export function parse(
             );
           }
           const [, p1, p2, p3, d12Raw, d13Raw, d23Raw] = tokens;
-          const id = ++shapeCounter;
-
-          // Centroid body point. Compute it directly so this works even when
-          // P1/P2/P3 have multi-character names (the implicit `ABC` body-ref
-          // trick relies on single-letter names).
-          const A = fig.pt(p1);
-          const B = fig.pt(p2);
-          const C = fig.pt(p3);
-          const bodyName = `_ms${id}_body`;
-          pushStep(
-            `myShape: body centroid ${bodyName} = average of ${p1}, ${p2}, ${p3}`,
-            [
-              { from: p1, to: p2 },
-              { from: p2, to: p3 },
-              { from: p3, to: p1 },
-            ],
-            (f) => {
-              f.point(bodyName, {
-                x: (A.x + B.x + C.x) / 3,
-                y: (A.y + B.y + C.y) / 3,
-              });
-              macroVis(f, bodyName);
-            }
+          emitThornyTriangle(
+            p1,
+            p2,
+            p3,
+            parseDir(d12Raw),
+            parseDir(d13Raw),
+            parseDir(d23Raw),
+            "myShape: "
           );
+          break;
+        }
 
-          const dCh = distanceFrac();
-          const k = dCh / (1 - 2 * dCh);
-
-          const edges: Array<[string, string, "in" | "out", string]> = [
-            [p1, p2, parseDir(d12Raw), "12"],
-            [p1, p3, parseDir(d13Raw), "13"],
-            [p2, p3, parseDir(d23Raw), "23"],
-          ];
-          for (const [a, b, mode, suf] of edges) {
-            emitShapeEdge(id, a, b, mode, suf, bodyName, k);
+        case "evolve": {
+          // evolve P1 P2
+          //   From two base points only: random LEFT/RIGHT arc apex (same geometry
+          //   as nest Option 2), then edge modes — one side to apex `in`, other `out`
+          //   (resolveNestSideSwap), base P1–P2 `in` with probability doubleInnProbability%.
+          //   Then same thorny-triangle + continuation pipeline as `myShape`.
+          if (tokens.length !== 3) {
+            throw new Error("usage: evolve P1 P2");
+          }
+          const [, p1n, p2n] = tokens;
+          if (!fig.has(p1n) || !fig.has(p2n)) {
+            throw new Error(`evolve: points "${p1n}" and/or "${p2n}" are not defined yet`);
+          }
+          const apexNm = inferEvolveApexName(p1n, p2n);
+          if (fig.has(apexNm) && !explicitPointLineNames.has(apexNm)) {
+            throw new Error(
+              `evolve: apex name "${apexNm}" already exists; rename base points or remove conflict`
+            );
           }
 
-          const passMax = nestContinuationMax();
-          if (passMax > 0) {
-            let wave = pendingInAnchors.splice(0, pendingInAnchors.length);
-            for (let pass = 0; pass < passMax && wave.length > 0; pass++) {
-              const nextWave: { p1: string; p2: string }[] = [];
-              continuationAnchorSink = (pair) => {
-                nextWave.push(pair);
-              };
-              try {
-                for (let wi = 0; wi < wave.length; wi++) {
-                  const { p1: na, p2: nb } = wave[wi]!;
-                  const inferredA = inferNestApexFromAnchors(na, nb);
-                  if (!inferredA) continue;
-                  const p3a = inferredA;
-                  const hostBody =
-                    nestAnchorHostBody.get(na) ?? nestAnchorHostBody.get(nb);
-                  const arrowTerminal =
-                    continuationEndArrow() &&
-                    passMax > 1 &&
-                    pass === passMax - 1;
-                  const stepPf = `[auto nest pass ${pass + 1}/${passMax}, pair ${wi + 1}/${wave.length}] `;
-                  if (!stepped) {
-                    runNestWithApexLayoutRetries({
-                      p1: na,
-                      p2: nb,
-                      p3: p3a,
-                      nextWave,
-                      placeApexSilent: (tryIdx) => {
-                        computeNestApexOnFigure(
-                          fig,
-                          p3a,
-                          na,
-                          nb,
-                          hostBody ?? null,
-                          tryIdx,
-                          pass === passMax - 1
-                        );
-                      },
-                      nestUserScriptedMeta: undefined,
-                      stepNotePrefix: stepPf,
-                      arrowTerminal,
-                      label: `Auto nest ${na}–${nb}`,
-                      allowDoubleInn: true,
-                    });
-                  } else {
-                    if (hostBody) {
-                      placePerpAwayFrom(p3a, na, nb, hostBody, "nest");
-                    } else {
-                      placeNestApexRandomLr(p3a, na, nb);
+          const placeEvolveApex = (targetFig: Figure, tryIdx: number) => {
+            computeNestApexOnFigure(
+              targetFig,
+              apexNm,
+              p1n,
+              p2n,
+              null,
+              tryIdx,
+              false
+            );
+          };
+
+          const chordHL: HelperLineSpec[] = [{ from: p1n, to: p2n }];
+
+          if (stepped) {
+            const planPreview = planNestArcApexLayout(
+              fig,
+              apexNm,
+              p1n,
+              p2n,
+              null,
+              0,
+              false
+            );
+            if (planPreview) {
+              pushStep(
+                `evolve: Selected ${planPreview.sideLabel} — apex on circle from ${planPreview.centerName}, radius |${p1n}–${p2n}|`,
+                chordHL,
+                () => {}
+              );
+              pushStep(
+                `evolve: thin gray = deciding circle; magenta = admissible arc; gray ticks = ⊥ cuts`,
+                chordHL,
+                () => {},
+                {
+                  helperPolylines: [
+                    {
+                      points: planPreview.circlePolyline,
+                      stroke: "#94a3b8",
+                      strokeWidth: 1.2,
+                    },
+                    {
+                      points: planPreview.arcPolyline,
+                      stroke: "#a21caf",
+                      strokeWidth: 2.5,
+                    },
+                  ],
+                  helperSegments: [
+                    ...planPreview.bisectorTicks,
+                    { a: planPreview.centerPoint, b: planPreview.apex },
+                  ],
+                  helperDots: [planPreview.centerPoint],
+                }
+              );
+            }
+            pushStep(
+              `evolve: place apex ${apexNm} on arc`,
+              chordHL,
+              (f) => {
+                if (!(explicitPointLineNames.has(apexNm) && f.has(apexNm))) {
+                  placeEvolveApex(f, 0);
+                }
+              },
+              planPreview ? { helperDots: [planPreview.apex] } : undefined
+            );
+            pushStep(
+              `evolve: choose base edge ${p1n}–${p2n} in/out (doubleInnProbability), side modes to apex, then build triangle`,
+              chordHL,
+              (f) => {
+                if (!(explicitPointLineNames.has(apexNm) && f.has(apexNm))) {
+                  placeEvolveApex(f, 0);
+                }
+                const maxT = nestLayoutMaxAttempts();
+                let ok = true;
+                if (!explicitPointLineNames.has(apexNm)) {
+                  ok = false;
+                  for (let k = 0; k < maxT; k++) {
+                    placeEvolveApex(f, k);
+                    const ap = f.pt(apexNm);
+                    if (!f.isPointInsideAnyFilledRegion(ap)) {
+                      ok = true;
+                      break;
                     }
-                    freePoints.push(p3a);
-                    let da13: "in" | "out" = "out";
-                    let da23: "in" | "out" = "in";
-                    const rAuto = resolveNestSideSwap(na, nb, p3a, fig);
-                    const swapRuleAuto = rAuto.swapRule;
-                    if (rAuto.swap) {
-                      da13 = "in";
-                      da23 = "out";
-                    }
-                    if (!arrowTerminal) {
-                      const mAuto = maybeApplyDoubleInn(
-                        na,
-                        nb,
-                        p3a,
-                        da13,
-                        da23,
-                        `${na}|${nb}|${p3a}|auto`
+                    if (k < maxT - 1) {
+                      infos.push(
+                        `evolve ${p1n} ${p2n}: RETRY ${k + 2}/${maxT} — apex inside filled area.`
                       );
-                      da13 = mAuto.d13;
-                      da23 = mAuto.d23;
-                      if (mAuto.applied) {
-                        infos.push(
-                          `Auto nest ${na}–${nb}: doubleInn applied (disp ${mAuto.displacementPct.toFixed(1)}% < 50%).`
-                        );
-                      }
                     }
-                    emitNestGeometry(
-                      na,
-                      nb,
-                      p3a,
-                      da13,
-                      da23,
-                      undefined,
-                      swapRuleAuto,
-                      stepPf,
-                      arrowTerminal
+                  }
+                  if (!ok) {
+                    infos.push(
+                      `evolve ${p1n} ${p2n}: apex remained inside filled areas after ${maxT} tries — skipped.`
                     );
+                    return;
                   }
                 }
-              } finally {
-                continuationAnchorSink = null;
+                const rngD12 = mulberry32(seedFor(`${p1n}|${p2n}|evolveD12`));
+                const d12: "in" | "out" =
+                  rngD12() * 100 < doubleInnProbabilityPct() ? "in" : "out";
+                let d13: "in" | "out" = "out";
+                let d23: "in" | "out" = "in";
+                const r = resolveNestSideSwap(p1n, p2n, apexNm, f);
+                if (r.swap) {
+                  d13 = "in";
+                  d23 = "out";
+                }
+                if (
+                  !implicitEvolveApexes.some(
+                    (e) => e.apex === apexNm && e.lineNum === scriptLineNum
+                  )
+                ) {
+                  implicitEvolveApexes.push({
+                    apex: apexNm,
+                    p1: p1n,
+                    p2: p2n,
+                    d12,
+                    d13,
+                    d23,
+                    lineNum: scriptLineNum,
+                  });
+                }
+                emitThornyTriangle(p1n, p2n, apexNm, d12, d13, d23, "evolve: ");
               }
-              wave = nextWave;
-            }
+            );
           } else {
-            pendingInAnchors.length = 0;
+            const maxT = nestLayoutMaxAttempts();
+            let ok = false;
+            for (let k = 0; k < maxT; k++) {
+              placeEvolveApex(fig, k);
+              const ap = fig.pt(apexNm);
+              if (!fig.isPointInsideAnyFilledRegion(ap)) {
+                ok = true;
+                break;
+              }
+              if (k < maxT - 1) {
+                infos.push(
+                  `evolve ${p1n} ${p2n}: RETRY ${k + 2}/${maxT} — apex inside filled area.`
+                );
+              }
+            }
+            if (!ok) {
+              infos.push(
+                `evolve ${p1n} ${p2n}: apex remained inside filled areas after ${maxT} tries — skipped.`
+              );
+              break;
+            }
+            freePoints.push(apexNm);
+            const rngD12 = mulberry32(seedFor(`${p1n}|${p2n}|evolveD12`));
+            const d12: "in" | "out" =
+              rngD12() * 100 < doubleInnProbabilityPct() ? "in" : "out";
+            let d13: "in" | "out" = "out";
+            let d23: "in" | "out" = "in";
+            const r = resolveNestSideSwap(p1n, p2n, apexNm, fig);
+            if (r.swap) {
+              d13 = "in";
+              d23 = "out";
+            }
+            if (
+              !implicitEvolveApexes.some(
+                (e) => e.apex === apexNm && e.lineNum === scriptLineNum
+              )
+            ) {
+              implicitEvolveApexes.push({
+                apex: apexNm,
+                p1: p1n,
+                p2: p2n,
+                d12,
+                d13,
+                d23,
+                lineNum: scriptLineNum,
+              });
+            }
+            emitThornyTriangle(p1n, p2n, apexNm, d12, d13, d23, "evolve: ");
           }
           break;
         }
@@ -2612,6 +2854,7 @@ export function parse(
       stepped ? scanFreePointNamesFromScript(script) : freePoints
     ),
     implicitNestApexes,
+    implicitEvolveApexes,
     buildSteps: stepped ? buildSteps : undefined,
   };
 }
@@ -2629,6 +2872,8 @@ export function parse(
  *   - If `name` is the inferred apex of a `nest P1 P2` or `nest P1 P2 REF` line,
  *     that line is replaced by `point NAME X Y` plus a six- or eight-token `nest`
  *     that keeps the same auto `d13`/`d23` (see {@link ParseResult.implicitNestApexes}).
+ *   - If `name` is the auto apex from `evolve P1 P2` (see {@link ParseResult.implicitEvolveApexes}),
+ *     that line is replaced by `point NAME X Y` plus `myShape P1 P2 NAME d12 d13 d23`.
  *   - Otherwise the script is returned unchanged.
  */
 export function updatePointInScript(
@@ -2660,7 +2905,7 @@ export function updatePointInScript(
     });
   }
 
-  const { implicitNestApexes } = parse(script);
+  const { implicitNestApexes, implicitEvolveApexes } = parse(script);
   const nestHit = implicitNestApexes.find((e) => e.apex === name);
   if (nestHit) {
     const lines = script.split("\n");
@@ -2685,6 +2930,27 @@ export function updatePointInScript(
     }
   }
 
+  const evolveHit = implicitEvolveApexes.find((e) => e.apex === name);
+  if (evolveHit) {
+    const lines = script.split("\n");
+    const idx = findImplicitEvolveLineIndex(lines, evolveHit);
+    if (idx !== null) {
+      const old = lines[idx]!;
+      const indent = old.match(/^\s*/)?.[0] ?? "";
+      const rx = Math.round(x);
+      const ry = Math.round(y);
+      const ptLine = `${indent}point ${name} ${rx} ${ry}`;
+      const myLine = `${indent}myShape ${evolveHit.p1} ${evolveHit.p2} ${name} ${evolveHit.d12} ${evolveHit.d13} ${evolveHit.d23}`;
+      const hashIdx = old.indexOf("#");
+      const trailComment = hashIdx >= 0 ? old.slice(hashIdx).trimEnd() : "";
+      const myWithComment = trailComment
+        ? `${myLine}  ${trailComment}`
+        : myLine;
+      lines.splice(idx, 1, ptLine, myWithComment);
+      return lines.join("\n");
+    }
+  }
+
   // Auto-generated continuation apex: make it persistent on first drag by
   // materializing a literal `point` before macro/nest expansion commands.
   const parsed = parse(script);
@@ -2698,7 +2964,7 @@ export function updatePointInScript(
       const stripped = lines[i]!.replace(/#.*/, "").trim();
       if (!stripped) continue;
       const cmd = stripped.split(/\s+/)[0]?.toLowerCase();
-      if (cmd === "myshape" || cmd === "nest") {
+      if (cmd === "myshape" || cmd === "nest" || cmd === "evolve") {
         insertAt = i;
         break;
       }
@@ -2708,6 +2974,23 @@ export function updatePointInScript(
   }
 
   return script;
+}
+
+function findImplicitEvolveLineIndex(
+  lines: string[],
+  e: ImplicitEvolveApexInfo
+): number | null {
+  for (let i = 0; i < lines.length; i++) {
+    const stripped = lines[i]!.replace(/#.*/, "").trim();
+    if (!stripped) continue;
+    const toks = stripped.split(/\s+/);
+    if (toks[0]?.toLowerCase() !== "evolve") continue;
+    if (toks.length !== 3) continue;
+    if (toks[1] !== e.p1 || toks[2] !== e.p2) continue;
+    if (inferEvolveApexName(toks[1]!, toks[2]!) !== e.apex) continue;
+    return i;
+  }
+  return null;
 }
 
 function findImplicitNestLineIndex(
