@@ -26,7 +26,8 @@ import {
  * Tiny text DSL for building a Figure.
  *
  *   const NAME VALUE                  # numeric constant, usable below (`true`/`false` → 1/0);
- *                                      # exceptions: `fillApexShape`, `fillApexShapeColor` (see below).
+ *                                      # exceptions: `fillApexShape`, `fillApexShapeColor`, `fillTubeShape`
+ *                                      # (see below).
  *   const averageSize N               # typical chord / layout scale in px
  *                                      # (default 160). Used as the center for
  *                                      # `perp` perpendicular offset (unless
@@ -166,6 +167,21 @@ import {
  *                                      # **off** = no fill (default if unset).
  *   const fillApexShapeColor #RGB      # optional fill (`#RRGGBB` or `#RGB`); line comments must use
  *                                      # a **space** before `#` only after the hex (e.g. `#ccc # note`).
+ *   const fillTubeShape in|out|off     # optional. After each `tube` / `spike` (opaque interior + side +
+ *                                      # cap arcs), when this is not **off** *or* **addMiddleArcs** is on,
+ *                                      # draw a **black** bridge between the **hub-seal midpoint** **P1–P2**
+ *                                      # (t = ½ on the same **smallBend** `dir: in` quadratic as the nest
+ *                                      # host-tube seal, so both ends sit on curved outlines) and the **cap
+ *                                      # arc midpoint** **Q1–Q2** (along the tube / stacking direction toward
+ *                                      # the tips — **not** between the two side-leg mids). The bridge’s
+ *                                      # signed bend is the **average of the two leg** signed bends (same
+ *                                      # `tubeBend` family as the sides). After **nest**
+ *                                      # host-tube mask repaint, the bridge is drawn **on top** of the white
+ *                                      # fill so it stays visible.
+ *                                      # When **fillTubeShape** is **in** or **out**, fill **only one half**
+ *                                      # of the tube (one side of the splitter): **in** = wedge on the
+ *                                      # **P1 / Q1** side (seal **P1**→mid toward cap **Q1**); **out** = wedge
+ *                                      # on the **P2 / Q2** side. Uses **fillApexShapeColor** (or its default).
  *                                      # All helper points are private; their
  *                                      # names start with `_ms`.
  *   perp NAME P1 P2 awayFrom REF      # Place NAME at the midpoint of the
@@ -536,6 +552,7 @@ export function parse(
   // -> "__body_ABC"). Re-used across multiple references in the same parse.
   const bodyCache = new Map<string, string>();
   let bodyCounter = 0;
+  let tubeBridgeEmitSeq = 0;
 
   const num = (s: string): number => {
     const n = Number(s);
@@ -627,14 +644,20 @@ export function parse(
     return consts.get("addMiddleArcs")! !== 0;
   };
 
+  /** Same stroke as boundary arcs (inherits `parse`’s `style`; defaults to black when unset). */
   const middleArcStyle = (): Style => ({
     ...(style ?? {}),
-    stroke: "#0d9488",
-    strokeWidth: 2.75,
   });
 
   const fillApexShapeSide = (): "off" | "in" | "out" => {
     const v = (stringConsts.get("fillApexShape") ?? "off").toLowerCase();
+    if (v === "out") return "out";
+    if (v === "in" || v === "inn") return "in";
+    return "off";
+  };
+
+  const fillTubeShapeSide = (): "off" | "in" | "out" => {
+    const v = (stringConsts.get("fillTubeShape") ?? "off").toLowerCase();
     if (v === "out") return "out";
     if (v === "in" || v === "inn") return "in";
     return "off";
@@ -669,19 +692,24 @@ export function parse(
     return ((q.x - a.x) * ux + (q.y - a.y) * uy) / len2;
   };
 
-  /** Samples the rim quadratic on edge `edgeA`–`edgeB` (same as first `emitShapeEdge` arc, mode in). */
+  /**
+   * Samples the rim quadratic on edge `edgeA`–`edgeB` (same as `emitShapeEdge`’s first rim arc).
+   * `rimArcDir` matches Figure `arc` **dir** toward `bodyNm`: **out** = bulge away (default thorny rim);
+   * **in** = bulge toward — used on nest **arrow-terminal** legs where `rimUsesMode` mirrors edge mode.
+   */
   const sampleRimQuadPoints = (
     f: Figure,
     edgeA: string,
     edgeB: string,
     bodyNm: string,
-    steps: number
+    steps: number,
+    rimArcDir: "in" | "out" = "out"
   ): Point[] => {
     const Pa = f.pt(edgeA);
     const Pb = f.pt(edgeB);
     const R = f.pt(resolveRefOn(f, bodyNm));
     const big = constOr("bigBend");
-    const bend = resolveSignedBend(Pa, Pb, R, "out", Math.abs(big));
+    const bend = resolveSignedBend(Pa, Pb, R, rimArcDir, Math.abs(big));
     const c = perpControl(Pa, Pb, bend);
     const n = Math.max(6, Math.floor(steps));
     const pts: Point[] = [];
@@ -782,6 +810,239 @@ export function parse(
     }
   };
 
+  const tubeLegSignedBendForFlip = (
+    f: Figure,
+    pLeg: string,
+    qLeg: string,
+    refTok: string,
+    dir: "in" | "out",
+    legFlip: "p1" | "p2" | null,
+    flipThis: "p1" | "p2"
+  ): number => {
+    const refNm = resolveRefOn(f, refTok);
+    const legMag = constOr("tubeBend");
+    let sb = resolveSignedBend(
+      f.pt(pLeg),
+      f.pt(qLeg),
+      f.pt(refNm),
+      dir,
+      legMag
+    );
+    if (legFlip === flipThis) sb = -sb;
+    return sb;
+  };
+
+  /** Samples `quadAt` along leg `pLeg`–`qLeg` (signed bend `sb`) for parameter t in `[tLo,tHi]`. */
+  const sampleTubeLegBetweenT = (
+    f: Figure,
+    pLeg: string,
+    qLeg: string,
+    sb: number,
+    tLo: number,
+    tHi: number,
+    steps: number
+  ): Point[] => {
+    const Pa = f.pt(pLeg);
+    const Pb = f.pt(qLeg);
+    const c = perpControl(Pa, Pb, sb);
+    const n = Math.max(4, Math.floor(steps));
+    const forward = tLo < tHi;
+    const a = forward ? tLo : tHi;
+    const b = forward ? tHi : tLo;
+    const pts: Point[] = [];
+    for (let i = 1; i <= n; i++) {
+      const u = i / n;
+      const t = a + u * (b - a);
+      pts.push(quadAt(Pa, c, Pb, t));
+    }
+    if (!forward) pts.reverse();
+    return pts;
+  };
+
+  const sampleTubeCapBetweenT = (
+    f: Figure,
+    q1s: string,
+    q2s: string,
+    sbCap: number,
+    tLo: number,
+    tHi: number,
+    steps: number
+  ): Point[] => {
+    const Pa = f.pt(q1s);
+    const Pb = f.pt(q2s);
+    const c = perpControl(Pa, Pb, sbCap);
+    const n = Math.max(4, Math.floor(steps));
+    const forward = tLo < tHi;
+    const a = forward ? tLo : tHi;
+    const b = forward ? tHi : tLo;
+    const pts: Point[] = [];
+    for (let i = 1; i <= n; i++) {
+      const u = i / n;
+      const t = a + u * (b - a);
+      pts.push(quadAt(Pa, c, Pb, t));
+    }
+    if (!forward) pts.reverse();
+    return pts;
+  };
+
+  const wantTubeMidBridge = (): boolean =>
+    addMiddleArcs() || fillTubeShapeSide() !== "off";
+
+  /**
+   * Bridge from **hub seal midpoint** (t = ½ on **P1–P2** with `smallBend`, `dir: in` — same as nest seal)
+   * to **cap midpoint** (Q1–Q2). Bridge bend is the **mean of the two leg signed bends** (`(sb1+sb2)/2`),
+   * so curvature matches the side arcs even when `resolveSignedBend(midHub, midCap, …)` would disagree
+   * (rare skew tubes). Optional half-tube wedge fill uses {@link apexFillColor}.
+   * @param legBendOverride — nest host replay: use these signed leg bends so cap/legs match repainted arcs.
+   */
+  const applyTubeLegMidBridgeAndFill = (
+    f: Figure,
+    stem: string,
+    p1: string,
+    p2: string,
+    q1: string,
+    q2: string,
+    dir: "in" | "out",
+    refTok: string,
+    legFlip: "p1" | "p2" | null,
+    legBendOverride?: { legSb1: number; legSb2: number }
+  ) => {
+    if (!wantTubeMidBridge()) return;
+    const refNm = resolveRefOn(f, refTok);
+    const sb1 =
+      legBendOverride?.legSb1 ??
+      tubeLegSignedBendForFlip(f, p1, q1, refTok, dir, legFlip, "p1");
+    const sb2 =
+      legBendOverride?.legSb2 ??
+      tubeLegSignedBendForFlip(f, p2, q2, refTok, dir, legFlip, "p2");
+    const small = constOr("smallBend");
+    const sbCap = resolveSignedBend(
+      f.pt(q1),
+      f.pt(q2),
+      f.pt(refNm),
+      dir,
+      small
+    );
+    const P1 = f.pt(p1);
+    const P2 = f.pt(p2);
+    const sbSeal = resolveSignedBend(P1, P2, f.pt(refNm), "in", small);
+    const cSeal = perpControl(P1, P2, sbSeal);
+    const midHub = quadAt(P1, cSeal, P2, 0.5);
+    const sampleSealP2ToMidHub = (steps: number): Point[] => {
+      const n = Math.max(4, Math.floor(steps));
+      const pts: Point[] = [];
+      for (let i = 1; i <= n; i++) {
+        const u = i / n;
+        const t = 1 - u * 0.5;
+        pts.push(quadAt(P1, cSeal, P2, t));
+      }
+      return pts;
+    };
+    const sampleSealP1ToMidHub = (steps: number): Point[] => {
+      const n = Math.max(4, Math.floor(steps));
+      const pts: Point[] = [];
+      for (let i = 1; i <= n; i++) {
+        const u = i / n;
+        const t = u * 0.5;
+        pts.push(quadAt(P1, cSeal, P2, t));
+      }
+      return pts;
+    };
+    const Qa1 = f.pt(q1);
+    const Qa2 = f.pt(q2);
+    const cCap = perpControl(Qa1, Qa2, sbCap);
+    const midCap = quadAt(Qa1, cCap, Qa2, 0.5);
+    const mb = `${stem}_mb`;
+    const mc = `${stem}_mc`;
+    f.point(mb, midHub);
+    f.point(mc, midCap);
+    macroVis(f, mb);
+    macroVis(f, mc);
+
+    /** Match side-leg signed curvature; avoids rare flat/wrong bridge vs `midHub→midCap` + ref alone. */
+    const sbBrid = (sb1 + sb2) * 0.5;
+    const ctrlBr = perpControl(midHub, midCap, sbBrid);
+    const tubeHalfFillSteps = 24;
+    const tubeHalfStrokeSteps = 28;
+
+    const fillSide = fillTubeShapeSide();
+    if (fillSide !== "off") {
+      const segs: RegionSeg[] = [];
+      for (let i = 1; i <= tubeHalfFillSteps; i++) {
+        segs.push({
+          kind: "line",
+          to: quadAt(midHub, ctrlBr, midCap, i / tubeHalfFillSteps),
+        });
+      }
+      const pushPoly = (pts: Point[]) => {
+        for (const p of pts) {
+          segs.push({ kind: "line", to: p });
+        }
+      };
+      if (fillSide === "out") {
+        // Half-tube on P2–Q2 side: bridge polyline + cap(mid→Q2) + leg(Q2→P2) + hub seal (P2→midHub).
+        pushPoly(sampleTubeCapBetweenT(f, q1, q2, sbCap, 0.5, 1, tubeHalfFillSteps).slice(1));
+        pushPoly(sampleTubeLegBetweenT(f, p2, q2, sb2, 1, 0, tubeHalfFillSteps).slice(1));
+        pushPoly(sampleSealP2ToMidHub(tubeHalfFillSteps));
+      } else {
+        pushPoly(sampleTubeCapBetweenT(f, q1, q2, sbCap, 0.5, 0, tubeHalfFillSteps).slice(1));
+        pushPoly(sampleTubeLegBetweenT(f, p1, q1, sb1, 1, 0, tubeHalfFillSteps).slice(1));
+        pushPoly(sampleSealP1ToMidHub(tubeHalfFillSteps));
+      }
+      f.add(new Region(midHub, segs, apexFillColor()));
+
+      if (fillSide === "out") {
+        strokeApexFillBasePolyline(
+          f,
+          `${stem}_ra`,
+          [
+            midCap,
+            ...sampleTubeCapBetweenT(f, q1, q2, sbCap, 0.5, 1, tubeHalfStrokeSteps).slice(1),
+          ],
+          style
+        );
+        strokeApexFillBasePolyline(
+          f,
+          `${stem}_rb`,
+          [...sampleTubeLegBetweenT(f, p2, q2, sb2, 1, 0, tubeHalfStrokeSteps)],
+          style
+        );
+        strokeApexFillBasePolyline(
+          f,
+          `${stem}_rc`,
+          [...sampleSealP2ToMidHub(tubeHalfStrokeSteps)],
+          style
+        );
+      } else {
+        strokeApexFillBasePolyline(
+          f,
+          `${stem}_ra`,
+          [
+            midCap,
+            ...sampleTubeCapBetweenT(f, q1, q2, sbCap, 0.5, 0, tubeHalfStrokeSteps).slice(1),
+          ],
+          style
+        );
+        strokeApexFillBasePolyline(
+          f,
+          `${stem}_rb`,
+          [...sampleTubeLegBetweenT(f, p1, q1, sb1, 1, 0, tubeHalfStrokeSteps)],
+          style
+        );
+        strokeApexFillBasePolyline(
+          f,
+          `${stem}_rc`,
+          [...sampleSealP1ToMidHub(tubeHalfStrokeSteps)],
+          style
+        );
+      }
+    }
+    f.arc(mb, mc, {
+      bend: sbBrid,
+      style: middleArcStyle(),
+    });
+  };
+
   /**
    * Wedge: teal bridge arc + leg path toward chosen base corner + base closing back to bridge start.
    * Returns the **corner** name used on the base (for redrawing strokes on top), or `null` if off.
@@ -799,7 +1060,13 @@ export function parse(
      * Mode along each base–apex leg (`baseA`–`apex` and `baseB`–`apex`). When a leg is **in**, the
      * wedge follows the **blade** big `dir: in` curve (closest to the bridge), not the outer rim.
      */
-    apexLegAlongModes?: { alongBaseA: "in" | "out"; alongBaseB: "in" | "out" }
+    apexLegAlongModes?: { alongBaseA: "in" | "out"; alongBaseB: "in" | "out" },
+    /**
+     * Nest continuation **arrow terminal**: legs are **rim-only** with `rimUsesMode` — rim `arc` **dir**
+     * equals edge mode (`in`/`out`), not the default rim **out**. Fill must sample that same rim or it
+     * mis-closes (often reads as a straight chord vs the black stroke).
+     */
+    nestArrowTerminal?: boolean
   ): string | null => {
     const side = fillApexShapeSide();
     if (side === "off") return null;
@@ -826,10 +1093,18 @@ export function parse(
         : cornerNm === baseA
           ? apexLegAlongModes.alongBaseA
           : apexLegAlongModes.alongBaseB;
-    const legFwd =
-      legAlong === "in"
+    const legFwd = (() => {
+      if (nestArrowTerminal && apexLegAlongModes) {
+        const edgeMode =
+          cornerNm === baseA
+            ? apexLegAlongModes.alongBaseA
+            : apexLegAlongModes.alongBaseB;
+        return sampleRimQuadPoints(f, cornerNm, apexNm, bodyNm, 18, edgeMode);
+      }
+      return legAlong === "in"
         ? sampleBladeInnerQuadPoints(f, cornerNm, apexNm, bodyNm, 18)
         : sampleRimQuadPoints(f, cornerNm, apexNm, bodyNm, 18);
+    })();
     const rimPts = legFwd.slice().reverse();
     const segs: RegionSeg[] = [{ kind: "quad", ctrl, to: p2 }];
     for (let i = 1; i < rimPts.length; i++) {
@@ -1223,11 +1498,28 @@ export function parse(
     );
 
     pushStep(
-      `Tube: cap arc ${q1}→${q2} (smallBend)`,
-      [{ from: q1, to: q2 }],
+      `Tube: cap ${q1}→${q2} (smallBend), then optional bridge hub-seal-mid **${p1}–${p2}** → cap-mid **${q1}–${q2}** (on top)`,
+      [
+        { from: q1, to: q2 },
+        { from: p1, to: q1 },
+        { from: p2, to: q2 },
+      ],
       (f) => {
         const refNm = resolveRefOn(f, refToken);
         emitTubeCapQ1Q2(f, q1, q2, dir, refNm);
+        if (wantTubeMidBridge()) {
+          applyTubeLegMidBridgeAndFill(
+            f,
+            `_tb${++tubeBridgeEmitSeq}`,
+            p1,
+            p2,
+            q1,
+            q2,
+            dir,
+            refToken,
+            legFlip
+          );
+        }
       }
     );
   };
@@ -2109,6 +2401,20 @@ export function parse(
             ref: tubeSpec.refPointName,
             style,
           });
+          if (wantTubeMidBridge()) {
+            applyTubeLegMidBridgeAndFill(
+              f,
+              `_tbNest${id}_m2_${++tubeBridgeEmitSeq}`,
+              tubeSpec.p1,
+              tubeSpec.p2,
+              tubeSpec.q1,
+              tubeSpec.q2,
+              tubeSpec.dir,
+              tubeSpec.refPointName,
+              tubeSpec.legFlip,
+              { legSb1: sb1, legSb2: sb2 }
+            );
+          }
         }
       }
     );
@@ -2155,7 +2461,8 @@ export function parse(
             p1,
             p2,
             bendPick,
-            { alongBaseA: eff13, alongBaseB: eff23 }
+            { alongBaseA: eff13, alongBaseB: eff23 },
+            arrowTerminal
           );
           if (fillCorner !== null) {
             const big = constOr("bigBend");
@@ -2721,6 +3028,24 @@ export function parse(
             });
             break;
           }
+          if (name === "fillTubeShape") {
+            const mode =
+              lv === "out"
+                ? "out"
+                : lv === "in" || lv === "inn"
+                  ? "in"
+                  : lv === "off" || lv === "false" || lv === "0"
+                    ? "off"
+                    : (() => {
+                        throw new Error(
+                          `const fillTubeShape: expected in|out|off (or 0), got "${valStr}"`
+                        );
+                      })();
+            pushStep(`const fillTubeShape = ${mode}`, undefined, () => {
+              stringConsts.set("fillTubeShape", mode);
+            });
+            break;
+          }
           const v =
             lv === "true" ? 1 : lv === "false" ? 0 : num(valStr);
           pushStep(`const ${name} = ${v}`, undefined, (_f) => {
@@ -2856,10 +3181,27 @@ export function parse(
             }
           );
           pushStep(
-            `tube: cap arc ${q1}→${q2} (smallBend, ${dirT})`,
-            [{ from: q1, to: q2 }],
+            `tube: cap ${q1}→${q2} (smallBend, ${dirT}), then optional bridge hub-seal-mid **${p1}–${p2}** → cap-mid **${q1}–${q2}** (on top)`,
+            [
+              { from: q1, to: q2 },
+              { from: p1, to: q1 },
+              { from: p2, to: q2 },
+            ],
             (f) => {
               emitTubeCapQ1Q2(f, q1, q2, dirT, resolveRefOn(f, refTok));
+              if (wantTubeMidBridge()) {
+                applyTubeLegMidBridgeAndFill(
+                  f,
+                  `_tb${++tubeBridgeEmitSeq}`,
+                  p1,
+                  p2,
+                  q1,
+                  q2,
+                  dirT,
+                  refTok,
+                  null
+                );
+              }
             }
           );
           break;
