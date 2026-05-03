@@ -327,6 +327,33 @@ export const quadAt = (p0: Point, p1: Point, p2: Point, t: number): Point => {
 };
 
 /**
+ * Parameter t in [0,1] on quadratic (p0, p1, p2) that minimizes distance to
+ * `target` (uniform grid search; good enough for macro helper placement).
+ */
+export const quadClosestT = (
+  p0: Point,
+  p1: Point,
+  p2: Point,
+  target: Point,
+  steps = 32
+): number => {
+  let bestT = 0.5;
+  let bestD = Infinity;
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const q = quadAt(p0, p1, p2, t);
+    const dx = q.x - target.x;
+    const dy = q.y - target.y;
+    const d = dx * dx + dy * dy;
+    if (d < bestD) {
+      bestD = d;
+      bestT = t;
+    }
+  }
+  return bestT;
+};
+
+/**
  * Control points of the quadratic Bezier sub-segment between parameters
  * `a` and `b` of the original curve (p0, p1, p2). The result is itself a
  * quadratic Bezier and can be drawn directly.

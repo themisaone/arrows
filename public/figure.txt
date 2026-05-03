@@ -53,6 +53,11 @@ const doubleInnProbability 30
 # -------------------------------
 const nestContinuations   4
 
+# Optional: teal bridge arc (myShape / evolve / nest); wedge fill is separate:
+const addMiddleArcs     1
+# const fillApexShape   out          # out = wedge toward triangle interior; in = toward outer rim
+# const fillApexShapeColor #cccccc
+
 # -------------------------------
 # Script, initial points given
 # -------------------------------

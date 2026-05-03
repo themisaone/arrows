@@ -6,6 +6,9 @@ import {
   nestApexChordHandednessMetrics,
   nestApexShouldSwapEdgeModes,
   perpControl,
+  quadAt,
+  quadClosestT,
+  quadSubSegment,
   signTowards,
   type NestSwapRuleInfo,
   type Point,
@@ -22,7 +25,8 @@ import {
 /**
  * Tiny text DSL for building a Figure.
  *
- *   const NAME VALUE                  # numeric constant, usable below (`true`/`false` → 1/0)
+ *   const NAME VALUE                  # numeric constant, usable below (`true`/`false` → 1/0);
+ *                                      # exceptions: `fillApexShape`, `fillApexShapeColor` (see below).
  *   const averageSize N               # typical chord / layout scale in px
  *                                      # (default 160). Used as the center for
  *                                      # `perp` perpendicular offset (unless
@@ -134,6 +138,34 @@ import {
  *                                      #          the same `distance` constant
  *                                      #          has its tube's bottom land
  *                                      #          exactly on this tube's top.
+ *   const addMiddleArcs 0|1            # optional. When **1** (or `true`), after the three
+ *                                      # edges `myShape`/`evolve` draws an extra **teal**
+ *                                      # **smallBend** arc that starts on the **blade outer** arc
+ *                                      # (never the **out** rim on **P1–P2**): if **d12** is **in**,
+ *                                      # from the midpoint of that arc on **P1–P2** (full chord
+ *                                      # `bigBend`, `dir=in` — toward the blade, opposite the rim+tube);
+ *                                      # if **d12** is **out**,
+ *                                      # from the blade-outer mid on the first **in** leg toward
+ *                                      # apex (**P1–P3** or **P2–P3**) to the opposite anchor
+ *                                      # (**P2** or **P1**). **Triple-in** (`myShape` / `evolve` with
+ *                                      # **d12**, **d13**, and **d23** all **in**): no teal bridge or apex
+ *                                      # fill on that triangle. **Nest** with **both** new sides **in**
+ *                                      # (`d13` & `d23` on the nested shape): same — no teal bridge / fill.
+ *                                      # Auto-nest: midpoint of the shared-base
+ *                                      # quadratic on **P1–P2** whose bulge lies **toward apex P3**
+ *                                      # (not the opposite / host-tube side), then arc to **P3**
+ *                                      # (`smallBend`, arc **dir=out** from the triangle body).
+ *                                      # Default **0**.
+ *   const fillApexShape in|inn|out|off # optional. With **addMiddleArcs**, fill the wedge bounded by
+ *                                      # the teal bridge arc and a sampled path along the leg: for an
+ *                                      # **in** leg, the **blade** big arc (`dir: in`, closest to the bridge);
+ *                                      # for **out**, the rim only. Base closing uses **blade outer** (thorny)
+ *                                      # or shared-base inward quad (nest) from the
+ *                                      # chosen corner to the bridge (no straight chord). **in** / **inn**
+ *                                      # = rimward wedge; **out** = interior wedge (other base corner).
+ *                                      # **off** = no fill (default if unset).
+ *   const fillApexShapeColor #RGB      # optional fill (`#RRGGBB` or `#RGB`); line comments must use
+ *                                      # a **space** before `#` only after the hex (e.g. `#ccc # note`).
  *                                      # All helper points are private; their
  *                                      # names start with `_ms`.
  *   perp NAME P1 P2 awayFrom REF      # Place NAME at the midpoint of the
@@ -323,6 +355,16 @@ const BLADE_DEFAULTS = {
 /** Background color used to paint the opaque interior of `tube`/`spike`. */
 const TUBE_FILL = "white";
 
+/**
+ * Strip `#…` end-of-line comments without eating `#RRGGBB` / `#RGB` colour tokens
+ * (e.g. `const fillApexShapeColor #cccccc` must keep the hex).
+ */
+function stripHashLineComment(line: string): string {
+  return line
+    .replace(/\s+#(?!(?:[0-9a-f]{3}|[0-9a-f]{6})(?:\s|$|#)).*$/i, "")
+    .trim();
+}
+
 // Tiny FNV-ish string hash + mulberry32 PRNG. Used so that `spike` can
 // pick a "random" distance that stays stable across re-parses (which
 // happen on every keystroke), while still differing per Q1/Q2 pair.
@@ -436,6 +478,8 @@ export function parse(
   const infos: string[] = [];
   const freePoints: string[] = [];
   const consts = new Map<string, number>();
+  /** String-valued script `const` entries (e.g. `fillApexShape`, `fillApexShapeColor`). */
+  const stringConsts = new Map<string, string>();
   const fig = new Figure();
   const stepped = options?.stepped ?? false;
   const buildSteps: BuildStep[] = [];
@@ -577,6 +621,265 @@ export function parse(
     return true;
   };
 
+  /** Extra chord→apex bridge arc in {@link emitThornyTriangle} and {@link emitNestGeometry}; default **off**. */
+  const addMiddleArcs = (): boolean => {
+    if (!consts.has("addMiddleArcs")) return false;
+    return consts.get("addMiddleArcs")! !== 0;
+  };
+
+  const middleArcStyle = (): Style => ({
+    ...(style ?? {}),
+    stroke: "#0d9488",
+    strokeWidth: 2.75,
+  });
+
+  const fillApexShapeSide = (): "off" | "in" | "out" => {
+    const v = (stringConsts.get("fillApexShape") ?? "off").toLowerCase();
+    if (v === "out") return "out";
+    if (v === "in" || v === "inn") return "in";
+    return "off";
+  };
+
+  const normalizeHexColorToken = (raw: string): string => {
+    const s = raw.trim().toLowerCase();
+    const h = s.startsWith("#") ? s.slice(1) : s;
+    if (/^[0-9a-f]{6}$/.test(h)) return `#${h}`;
+    if (/^[0-9a-f]{3}$/.test(h)) {
+      return `#${h[0]}${h[0]}${h[1]}${h[1]}${h[2]}${h[2]}`;
+    }
+    throw new Error(`expected #RGB or #RRGGBB, got "${raw}"`);
+  };
+
+  const apexFillColor = (): string => {
+    const c = stringConsts.get("fillApexShapeColor");
+    if (c) {
+      try {
+        return normalizeHexColorToken(c);
+      } catch {
+        /* fall through */
+      }
+    }
+    return "#99f6e4";
+  };
+
+  const chordProjT = (q: Point, a: Point, b: Point): number => {
+    const ux = b.x - a.x;
+    const uy = b.y - a.y;
+    const len2 = ux * ux + uy * uy || 1;
+    return ((q.x - a.x) * ux + (q.y - a.y) * uy) / len2;
+  };
+
+  /** Samples the rim quadratic on edge `edgeA`–`edgeB` (same as first `emitShapeEdge` arc, mode in). */
+  const sampleRimQuadPoints = (
+    f: Figure,
+    edgeA: string,
+    edgeB: string,
+    bodyNm: string,
+    steps: number
+  ): Point[] => {
+    const Pa = f.pt(edgeA);
+    const Pb = f.pt(edgeB);
+    const R = f.pt(resolveRefOn(f, bodyNm));
+    const big = constOr("bigBend");
+    const bend = resolveSignedBend(Pa, Pb, R, "out", Math.abs(big));
+    const c = perpControl(Pa, Pb, bend);
+    const n = Math.max(6, Math.floor(steps));
+    const pts: Point[] = [];
+    for (let i = 0; i <= n; i++) {
+      pts.push(quadAt(Pa, c, Pb, i / n));
+    }
+    return pts;
+  };
+
+  /**
+   * Samples the **blade** big quadratic on `edgeA`–`edgeB` with `dir: "in"` (same as first `emitBlade`
+   * arc on an **in** edge): bulges toward the body — the black arc **closest** to a teal bridge that
+   * starts on the base side of the triangle.
+   */
+  const sampleBladeInnerQuadPoints = (
+    f: Figure,
+    edgeA: string,
+    edgeB: string,
+    bodyNm: string,
+    steps: number
+  ): Point[] => {
+    const Pa = f.pt(edgeA);
+    const Pb = f.pt(edgeB);
+    const R = f.pt(resolveRefOn(f, bodyNm));
+    const big = constOr("bigBend");
+    const bend = resolveSignedBend(Pa, Pb, R, "in", Math.abs(big));
+    const c = perpControl(Pa, Pb, bend);
+    const n = Math.max(6, Math.floor(steps));
+    const pts: Point[] = [];
+    for (let i = 0; i <= n; i++) {
+      pts.push(quadAt(Pa, c, Pb, i / n));
+    }
+    return pts;
+  };
+
+  /**
+   * Samples the quadratic on chord `baseA`–`baseB` that closes the apex fill toward `bridgeStartNm`
+   * (same as the fill region’s base edge): full chain from the fill corner anchor to the bridge.
+   */
+  const apexFillBaseCloseStrokePoints = (
+    f: Figure,
+    bridgeStartNm: string,
+    cornerNm: string,
+    baseA: string,
+    baseB: string,
+    bodyNm: string,
+    nestBaseQuadBend?: number,
+    steps = 20
+  ): Point[] => {
+    const Pa = f.pt(baseA);
+    const Pb = f.pt(baseB);
+    const p0 = f.pt(bridgeStartNm);
+    const n = Math.max(8, Math.floor(steps));
+    if (nestBaseQuadBend !== undefined) {
+      const PctrlB = perpControl(Pa, Pb, nestBaseQuadBend);
+      const tHit = quadClosestT(Pa, PctrlB, Pb, p0, 64);
+      const a = cornerNm === baseA ? 0 : tHit;
+      const b = cornerNm === baseA ? tHit : 1;
+      const lo = Math.min(a, b);
+      const hi = Math.max(a, b);
+      const [q0, q1, q2] = quadSubSegment(Pa, PctrlB, Pb, lo, hi);
+      const pts: Point[] = [];
+      for (let i = 0; i <= n; i++) {
+        pts.push(quadAt(q0, q1, q2, i / n));
+      }
+      return pts;
+    }
+    const B = Math.abs(constOr("bigBend"));
+    const R = f.pt(resolveRefOn(f, bodyNm));
+    const bendBase = resolveSignedBend(Pa, Pb, R, "in", B);
+    const PcB = perpControl(Pa, Pb, bendBase);
+    const tHit = quadClosestT(Pa, PcB, Pb, p0, 64);
+    const a = cornerNm === baseA ? 0 : tHit;
+    const b = cornerNm === baseA ? tHit : 1;
+    const lo = Math.min(a, b);
+    const hi = Math.max(a, b);
+    const [q0, q1, q2] = quadSubSegment(Pa, PcB, Pb, lo, hi);
+    const pts: Point[] = [];
+    for (let i = 0; i <= n; i++) {
+      pts.push(quadAt(q0, q1, q2, i / n));
+    }
+    return pts;
+  };
+
+  /** Re-stroke only the base closing curve of the apex fill (not full P1–P2 / tube-spanning arcs). */
+  const strokeApexFillBasePolyline = (
+    f: Figure,
+    stem: string,
+    pts: Point[],
+    strokeStyle?: Style
+  ) => {
+    if (pts.length < 2) return;
+    for (let i = 0; i < pts.length; i++) {
+      f.point(`${stem}_${i}`, pts[i]!);
+    }
+    for (let i = 0; i < pts.length - 1; i++) {
+      f.line(`${stem}_${i}`, `${stem}_${i + 1}`, strokeStyle);
+    }
+  };
+
+  /**
+   * Wedge: teal bridge arc + leg path toward chosen base corner + base closing back to bridge start.
+   * Returns the **corner** name used on the base (for redrawing strokes on top), or `null` if off.
+   */
+  const emitApexBridgeFillIfEnabled = (
+    f: Figure,
+    bridgeStartNm: string,
+    apexNm: string,
+    bodyNm: string,
+    baseA: string,
+    baseB: string,
+    /** Nest shared-base quadratic bend; when set, base closing follows that arc (not blade/rim). */
+    nestBaseQuadBend?: number,
+    /**
+     * Mode along each base–apex leg (`baseA`–`apex` and `baseB`–`apex`). When a leg is **in**, the
+     * wedge follows the **blade** big `dir: in` curve (closest to the bridge), not the outer rim.
+     */
+    apexLegAlongModes?: { alongBaseA: "in" | "out"; alongBaseB: "in" | "out" }
+  ): string | null => {
+    const side = fillApexShapeSide();
+    if (side === "off") return null;
+    const p0 = f.pt(bridgeStartNm);
+    const p2 = f.pt(apexNm);
+    const Rb = f.pt(resolveRefOn(f, bodyNm));
+    const mag = Math.abs(constOr("smallBend"));
+    const bend = resolveSignedBend(p0, p2, Rb, "out", mag);
+    const ctrl = perpControl(p0, p2, bend);
+    const Pa = f.pt(baseA);
+    const Pb = f.pt(baseB);
+    const foot = footOnLineThrough(Pa, Pb, p2);
+    const tf = chordProjT(foot, Pa, Pb);
+    const t0 = chordProjT(p0, Pa, Pb);
+    /** Base corner on the centroid / “interior” side of the bridge along the chord. */
+    const cornerInterior = t0 >= tf ? baseB : baseA;
+    /** Opposite base corner (toward the outer rim along the base). */
+    const cornerRimward = t0 >= tf ? baseA : baseB;
+    // Script tokens: **in** = rimward wedge, **out** = interior wedge (user mental model).
+    const cornerNm = side === "in" ? cornerRimward : cornerInterior;
+    const legAlong =
+      apexLegAlongModes === undefined
+        ? ("out" as const)
+        : cornerNm === baseA
+          ? apexLegAlongModes.alongBaseA
+          : apexLegAlongModes.alongBaseB;
+    const legFwd =
+      legAlong === "in"
+        ? sampleBladeInnerQuadPoints(f, cornerNm, apexNm, bodyNm, 18)
+        : sampleRimQuadPoints(f, cornerNm, apexNm, bodyNm, 18);
+    const rimPts = legFwd.slice().reverse();
+    const segs: RegionSeg[] = [{ kind: "quad", ctrl, to: p2 }];
+    for (let i = 1; i < rimPts.length; i++) {
+      segs.push({ kind: "line", to: rimPts[i]! });
+    }
+    const baseClosePolyline = (): Point[] =>
+      apexFillBaseCloseStrokePoints(
+        f,
+        bridgeStartNm,
+        cornerNm,
+        baseA,
+        baseB,
+        bodyNm,
+        nestBaseQuadBend,
+        14
+      ).slice(1);
+    for (const q of baseClosePolyline()) {
+      segs.push({ kind: "line", to: q });
+    }
+    f.add(new Region(p0, segs, apexFillColor()));
+    return cornerNm;
+  };
+
+  /** Re-paint rim (+ blade outer + inner F–G when mode is `in`) so strokes sit above apex fill. */
+  const redrawThornyShapeEdgeStrokes = (
+    f: Figure,
+    shapeId: number,
+    bodyRef: string,
+    a: string,
+    b: string,
+    mode: "in" | "out",
+    suf: "12" | "13" | "23"
+  ) => {
+    const big = constOr("bigBend");
+    f.arc(a, b, { bend: big, dir: "out", ref: bodyRef, style });
+    if (mode === "in") {
+      f.arc(a, b, { bend: big, dir: "in", ref: bodyRef, style });
+      const fNm = `_ms${shapeId}_F${suf}`;
+      const gNm = `_ms${shapeId}_G${suf}`;
+      if (f.has(fNm) && f.has(gNm)) {
+        f.arc(fNm, gNm, {
+          bend: constOr("smallBend"),
+          dir: "in",
+          ref: resolveRefOn(f, bodyRef),
+          style,
+        });
+      }
+    }
+  };
+
   /** Max apex re-picks per inferred `nest` when apex falls inside a filled area. */
   const nestLayoutMaxAttempts = (): number => {
     if (consts.has("nestLayoutMaxAttempts")) {
@@ -635,6 +938,26 @@ export function parse(
       return synth;
     }
     throw new Error(`unknown point or body "${token}"`);
+  };
+
+  /**
+   * Midpoint (t=½) of the **blade outer** quadratic on chord `pA`–`pB`, matching
+   * {@link emitBlade}'s first `f.arc(from, to, { bend: bigBend, dir: "in", ref })`
+   * (the arc toward the blade interior, opposite the rim/tube side on that edge).
+   */
+  const bladeOuterArcMidOnChord = (
+    f: Figure,
+    pA: string,
+    pB: string,
+    refBodyName: string
+  ): Point => {
+    const Pa = f.pt(pA);
+    const Pb = f.pt(pB);
+    const R = f.pt(resolveRefOn(f, refBodyName));
+    const big = constOr("bigBend");
+    const bend = resolveSignedBend(Pa, Pb, R, "in", Math.abs(big));
+    const Pc = perpControl(Pa, Pb, bend);
+    return quadAt(Pa, Pc, Pb, 0.5);
   };
 
   /** blade body (without the usage check): outer arc + inner arc through F, G. */
@@ -1789,6 +2112,106 @@ export function parse(
         }
       }
     );
+
+    if (addMiddleArcs() && !(eff13 === "in" && eff23 === "in")) {
+      const bridgeMid = `_ms${id}_nestChordMidToApex`;
+      pushStep(
+        `${stepNotePrefix}nest bridge → ${p3}: midpoint of shared-base arc (${p1}–${p2}) bulging **toward** ${p3} (apex side, not host/tube), to apex`,
+        [
+          { from: p1, to: p2 },
+          { from: p1, to: p3 },
+          { from: p2, to: p3 },
+        ],
+        (f) => {
+          const Pa = f.pt(p1);
+          const Pb = f.pt(p2);
+          const refNm = hostRef ?? bodyName;
+          const bSigned = nestSharedBaseOutBend(f, refNm);
+          const Papex = f.pt(p3);
+          const midNeg = quadAt(
+            Pa,
+            perpControl(Pa, Pb, -bSigned),
+            Pb,
+            0.5
+          );
+          const midPos = quadAt(
+            Pa,
+            perpControl(Pa, Pb, bSigned),
+            Pb,
+            0.5
+          );
+          const bendPick =
+            distance(midNeg, Papex) <= distance(midPos, Papex)
+              ? -bSigned
+              : bSigned;
+          const Pctrl = perpControl(Pa, Pb, bendPick);
+          const mid = quadAt(Pa, Pctrl, Pb, 0.5);
+          f.point(bridgeMid, mid);
+          const fillCorner = emitApexBridgeFillIfEnabled(
+            f,
+            bridgeMid,
+            p3,
+            bodyName,
+            p1,
+            p2,
+            bendPick,
+            { alongBaseA: eff13, alongBaseB: eff23 }
+          );
+          if (fillCorner !== null) {
+            const big = constOr("bigBend");
+            const rimL = (m: "in" | "out"): "in" | "out" =>
+              arrowTerminal ? m : "out";
+            // Only the leg apex–fillCorner (not the shared base or tube): avoids exposing base arcs
+            // that should stay under the host tube. Repaint **only** the arc that bounds the fill on
+            // that leg (blade `dir: in` when the edge is **in** — not the outer rim or F–G).
+            if (fillCorner === p1) {
+              if (eff13 === "in") {
+                if (arrowTerminal) {
+                  f.arc(p1, p3, { bend: big, dir: rimL(eff13), ref: bodyName, style });
+                } else {
+                  f.arc(p1, p3, { bend: big, dir: "in", ref: bodyName, style });
+                }
+              } else {
+                f.arc(p1, p3, { bend: big, dir: "out", ref: bodyName, style });
+              }
+            } else {
+              if (eff23 === "in") {
+                if (arrowTerminal) {
+                  f.arc(p2, p3, { bend: big, dir: rimL(eff23), ref: bodyName, style });
+                } else {
+                  f.arc(p2, p3, { bend: big, dir: "in", ref: bodyName, style });
+                }
+              } else {
+                f.arc(p2, p3, { bend: big, dir: "out", ref: bodyName, style });
+              }
+            }
+            strokeApexFillBasePolyline(
+              f,
+              `_ms${id}_fillBaseClNest`,
+              apexFillBaseCloseStrokePoints(
+                f,
+                bridgeMid,
+                fillCorner,
+                p1,
+                p2,
+                bodyName,
+                bendPick,
+                22
+              ),
+              style
+            );
+          }
+          macroVis(f, bridgeMid);
+          const b = constOr("smallBend");
+          f.arc(bridgeMid, p3, {
+            bend: b,
+            dir: "out",
+            ref: bodyName,
+            style: middleArcStyle(),
+          });
+        }
+      );
+    }
   };
 
   type NestTubeReplayEntry = {
@@ -2091,12 +2514,174 @@ export function parse(
       emitShapeEdge(id, a, b, mode, suf, bodyName, k);
     }
 
+    if (addMiddleArcs() && !(d12 === "in" && d13 === "in" && d23 === "in")) {
+      type MidPlan =
+        | { ok: false }
+        | {
+            ok: true;
+            fromA: string;
+            fromB: string;
+            to: string;
+            note: string;
+          };
+      const midPlan: MidPlan = (() => {
+        if (d12 === "in") {
+          return {
+            ok: true,
+            fromA: p1,
+            fromB: p2,
+            to: p3,
+            note: `blade outer arc mid on ${p1}–${p2} → ${p3}`,
+          };
+        }
+        if (d13 === "in" && d23 !== "in") {
+          return {
+            ok: true,
+            fromA: p1,
+            fromB: p3,
+            to: p2,
+            note: `blade outer arc mid on ${p1}–${p3} → ${p2} — P1–P2 rim-only`,
+          };
+        }
+        if (d23 === "in" && d13 !== "in") {
+          return {
+            ok: true,
+            fromA: p2,
+            fromB: p3,
+            to: p1,
+            note: `blade outer arc mid on ${p2}–${p3} → ${p1} — P1–P2 rim-only`,
+          };
+        }
+        if (d13 === "in" && d23 === "in") {
+          const o13 = bladeOuterArcMidOnChord(fig, p1, p3, bodyName);
+          const o23 = bladeOuterArcMidOnChord(fig, p2, p3, bodyName);
+          const e13 = (o13.x - C.x) ** 2 + (o13.y - C.y) ** 2;
+          const e23 = (o23.x - C.x) ** 2 + (o23.y - C.y) ** 2;
+          if (e13 <= e23) {
+            return {
+              ok: true,
+              fromA: p1,
+              fromB: p3,
+              to: p2,
+              note: `blade outer arc mid on ${p1}–${p3} → ${p2} (both legs in; mid nearer ${p3})`,
+            };
+          }
+          return {
+            ok: true,
+            fromA: p2,
+            fromB: p3,
+            to: p1,
+            note: `blade outer arc mid on ${p2}–${p3} → ${p1} (both legs in; mid nearer ${p3})`,
+          };
+        }
+        return { ok: false };
+      })();
+
+      if (midPlan.ok) {
+        const bridgeMid = `_ms${id}_chordMidToApex`;
+        pushStep(
+          `${stepPrefix}bridge arc: ${midPlan.note}`,
+          [
+            { from: midPlan.fromA, to: midPlan.fromB },
+            { from: midPlan.fromA, to: midPlan.to },
+            { from: midPlan.fromB, to: midPlan.to },
+          ],
+          (f) => {
+            const mid = bladeOuterArcMidOnChord(
+              f,
+              midPlan.fromA,
+              midPlan.fromB,
+              bodyName
+            );
+            f.point(bridgeMid, mid);
+            const edgeMode = (u: string, v: string): "in" | "out" => {
+              const s = new Set([u, v]);
+              if (s.has(p1) && s.has(p2)) return d12;
+              if (s.has(p1) && s.has(p3)) return d13;
+              return d23;
+            };
+            const fillCorner = emitApexBridgeFillIfEnabled(
+              f,
+              bridgeMid,
+              midPlan.to,
+              bodyName,
+              midPlan.fromA,
+              midPlan.fromB,
+              undefined,
+              {
+                alongBaseA: edgeMode(midPlan.fromA, midPlan.to),
+                alongBaseB: edgeMode(midPlan.fromB, midPlan.to),
+              }
+            );
+            if (fillCorner !== null) {
+              const edgeSuf = (x: string, y: string): "12" | "13" | "23" => {
+                const s = new Set([x, y]);
+                if (s.has(p1) && s.has(p2)) return "12";
+                if (s.has(p1) && s.has(p3)) return "13";
+                return "23";
+              };
+              const legS = edgeSuf(fillCorner, midPlan.to);
+              const legMode = legS === "12" ? d12 : legS === "13" ? d13 : d23;
+              const legOrd =
+                legS === "12"
+                  ? ([p1, p2] as const)
+                  : legS === "13"
+                    ? ([p1, p3] as const)
+                    : ([p2, p3] as const);
+              const big = constOr("bigBend");
+              if (legMode === "in") {
+                f.arc(legOrd[0], legOrd[1], {
+                  bend: big,
+                  dir: "in",
+                  ref: bodyName,
+                  style,
+                });
+              } else {
+                redrawThornyShapeEdgeStrokes(
+                  f,
+                  id,
+                  bodyName,
+                  legOrd[0],
+                  legOrd[1],
+                  legMode,
+                  legS
+                );
+              }
+              strokeApexFillBasePolyline(
+                f,
+                `_ms${id}_fillBaseClTh`,
+                apexFillBaseCloseStrokePoints(
+                  f,
+                  bridgeMid,
+                  fillCorner,
+                  midPlan.fromA,
+                  midPlan.fromB,
+                  bodyName,
+                  undefined,
+                  22
+                ),
+                style
+              );
+            }
+            macroVis(f, bridgeMid);
+            const b = constOr("smallBend");
+            f.arc(bridgeMid, midPlan.to, {
+              bend: b,
+              dir: "out",
+              ref: bodyName,
+              style: middleArcStyle(),
+            });
+          }
+        );
+      }
+    }
+
     runAutoNestContinuationWaves(stepPrefix);
   };
 
   for (let i = 0; i < scriptLines.length; i++) {
     const lineNum = i + 1;
-    const stripped = scriptLines[i]!.replace(/#.*/, "").trim();
+    const stripped = stripHashLineComment(scriptLines[i]!);
     if (!stripped) continue;
 
     const tokens = stripped.split(/\s+/);
@@ -2111,6 +2696,31 @@ export function parse(
           }
           const [, name, valStr] = tokens;
           const lv = valStr.toLowerCase();
+          if (name === "fillApexShape") {
+            const mode =
+              lv === "out"
+                ? "out"
+                : lv === "in" || lv === "inn"
+                  ? "in"
+                  : lv === "off" || lv === "false" || lv === "0"
+                    ? "off"
+                    : (() => {
+                        throw new Error(
+                          `const fillApexShape: expected in|inn|out|off (or 0), got "${valStr}"`
+                        );
+                      })();
+            pushStep(`const fillApexShape = ${mode}`, undefined, () => {
+              stringConsts.set("fillApexShape", mode);
+            });
+            break;
+          }
+          if (name === "fillApexShapeColor") {
+            const hex = normalizeHexColorToken(valStr);
+            pushStep(`const fillApexShapeColor = ${hex}`, undefined, () => {
+              stringConsts.set("fillApexShapeColor", hex);
+            });
+            break;
+          }
           const v =
             lv === "true" ? 1 : lv === "false" ? 0 : num(valStr);
           pushStep(`const ${name} = ${v}`, undefined, (_f) => {
