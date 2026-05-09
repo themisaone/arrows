@@ -1,0 +1,21 @@
+State of arrows
+===========================================
+
+* Det meste går bra - han tegner det Jeg vill
+* men - rekkeføkge hvordan han tegner er litt rar 
+    * tegner - og så må man re-tegene etter at vi har fyllt med shape
+
+* Det siste som han har lagt til:  nestCollisionCheck   = 1 gjør at det stopper tidlig
+* Hvis du setter den til 0 - da er det 'normalt' - som beskrevet over
+
+
+* Gidder ikke å fikse det akkurat nå
+
+* Alt er gjort med Cursor / Auto uten ingrippen av OPUS eler noe annet (dyrt)
+
+* Den er upresis her og der men la gå .... Til neste runde
+
+* User interface er litt rar - mye kunne ha blitt gjort
+
+
+

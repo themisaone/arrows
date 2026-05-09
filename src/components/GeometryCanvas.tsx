@@ -149,6 +149,8 @@ const GeometryCanvas: React.FC = () => {
   const [stepThrough, setStepThrough] = useState(false);
   const [appliedSteps, setAppliedSteps] = useState(0);
   const [buildLog, setBuildLog] = useState<string[]>([]);
+  /** When true, hide sky-blue nest `infos` (cleared on script/parse change, or explicitly). */
+  const [nestNotesCleared, setNestNotesCleared] = useState(false);
   /** When true, show macro helper dots + labels (`_ms…`, T*a/b, nest markers). Default off = drawing only. */
   const [showBuilderOverlays, setShowBuilderOverlays] = useState(false);
   /** When false, `dot` / `markers` in the script draw nothing. */
@@ -195,6 +197,14 @@ const GeometryCanvas: React.FC = () => {
     [script, parseOpts]
   );
 
+  const nestInfosDisplay = nestNotesCleared
+    ? []
+    : (fullParse.infos ?? []);
+
+  useEffect(() => {
+    if (!stepThrough) setNestNotesCleared(false);
+  }, [script, parseOpts, stepThrough]);
+
   const steppedParse = useMemo(
     () =>
       stepThrough
@@ -217,6 +227,7 @@ const GeometryCanvas: React.FC = () => {
     if (!stepThrough) return;
     setAppliedSteps(0);
     setBuildLog([BUILD_LOG_INTRO]);
+    setNestNotesCleared(true);
   }, [stepThrough, script]);
 
   useLayoutEffect(() => {
@@ -398,7 +409,11 @@ const GeometryCanvas: React.FC = () => {
             <input
               type="checkbox"
               checked={stepThrough}
-              onChange={(e) => setStepThrough(e.target.checked)}
+              onChange={(e) => {
+                const on = e.target.checked;
+                setStepThrough(on);
+                if (!on) setNestNotesCleared(false);
+              }}
               className="rounded border-slate-400"
             />
             Step-through
@@ -540,13 +555,13 @@ const GeometryCanvas: React.FC = () => {
             <span className="text-slate-400 font-normal">
               {fullParse.freePoints.length} point
               {fullParse.freePoints.length === 1 ? "" : "s"}
-              {(fullParse.infos?.length ?? 0) > 0 && (
+              {nestInfosDisplay.length > 0 && (
                 <span
                   className="text-sky-700"
                   title="Nest apex clearance / retry notes (see panel below)"
                 >
                   {" "}
-                  · nest notes {fullParse.infos!.length}
+                  · nest notes {nestInfosDisplay.length}
                 </span>
               )}
             </span>
@@ -558,11 +573,24 @@ const GeometryCanvas: React.FC = () => {
             spellCheck={false}
             className="flex-grow font-mono text-xs p-3 outline-none resize-none bg-slate-50"
           />
-          {(fullParse.errors.length > 0 || (fullParse.infos?.length ?? 0) > 0) && (
+          {(fullParse.errors.length > 0 || nestInfosDisplay.length > 0) && (
             <div className="border-t border-rose-200 bg-rose-50 text-rose-700 text-xs p-2 max-h-40 overflow-y-auto space-y-1">
-              {(fullParse.infos ?? []).map((msg, i) => (
+              {(fullParse.infos?.length ?? 0) > 0 && (
+                <div className="flex justify-end gap-1.5 pb-1 mb-0.5 border-b border-rose-100">
+                  <button
+                    type="button"
+                    onClick={() => setNestNotesCleared(true)}
+                    disabled={nestInfosDisplay.length === 0}
+                    className="text-[10px] font-semibold px-2 py-0.5 rounded border border-sky-300 bg-white text-sky-900 hover:bg-sky-50 disabled:opacity-40 disabled:cursor-not-allowed"
+                    title="Hide nest retry / apex messages until you edit the script or turn Step-through off"
+                  >
+                    Clear nest notes
+                  </button>
+                </div>
+              )}
+              {nestInfosDisplay.map((msg, i) => (
                 <div
-                  key={`info-${i}`}
+                  key={`info-${i}-${msg.slice(0, 24)}`}
                   className="font-mono text-sky-900 bg-sky-50 border border-sky-200 rounded px-1.5 py-0.5"
                 >
                   {msg}

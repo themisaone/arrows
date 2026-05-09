@@ -36,6 +36,15 @@ const tubeBend       0.06
 const nestLayoutMaxAttempts 8
 
 # -------------------------------
+# When 1: after apex passes the fill
+# test, reject nest / auto-nest (and
+# non-stepped evolve) if new strokes
+# strictly cross prior strokes
+# (flattened arcs). Default 0 = off.
+# -------------------------------
+const nestCollisionCheck 0
+
+# -------------------------------
 # Probability of creating
 # shape with 'diuble' innwards
 # -------------------------------

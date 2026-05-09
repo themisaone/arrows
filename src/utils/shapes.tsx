@@ -5,9 +5,47 @@ import {
   quadAt,
   quadPath,
   quadSubSegment,
+  segmentsIntersectOpenBothStrict,
   signTowards,
   type Point,
 } from "./geometry";
+
+/** Perpendicular distance from `p` to the infinite line through `L0`–`L1`. */
+const distPointToLine = (p: Point, L0: Point, L1: Point): number => {
+  const dx = L1.x - L0.x;
+  const dy = L1.y - L0.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const nx = -dy / len;
+  const ny = dx / len;
+  return Math.abs((p.x - L0.x) * nx + (p.y - L0.y) * ny);
+};
+
+/** Both endpoints of segment `a`–`b` lie within `slabPx` of the line `L0`–`L1`. */
+const segmentInChordSlab = (
+  a: Point,
+  b: Point,
+  L0: Point,
+  L1: Point,
+  slabPx: number
+): boolean =>
+  distPointToLine(a, L0, L1) < slabPx && distPointToLine(b, L0, L1) < slabPx;
+
+const segmentAabbOverlap = (
+  a: Point,
+  b: Point,
+  c: Point,
+  d: Point
+): boolean => {
+  const minx1 = Math.min(a.x, b.x);
+  const maxx1 = Math.max(a.x, b.x);
+  const miny1 = Math.min(a.y, b.y);
+  const maxy1 = Math.max(a.y, b.y);
+  const minx2 = Math.min(c.x, d.x);
+  const maxx2 = Math.max(c.x, d.x);
+  const miny2 = Math.min(c.y, d.y);
+  const maxy2 = Math.max(c.y, d.y);
+  return !(maxx1 < minx2 || maxx2 < minx1 || maxy1 < miny2 || maxy2 < miny1);
+};
 
 /**
  * Object model for the figure.
@@ -693,6 +731,140 @@ export class Figure implements Shape {
     };
     for (const s of this.shapes) walk(s);
     return out;
+  }
+
+  /** Snapshot of current drawable shapes (object identity) for diffing after a macro emit. */
+  priorShapeSnapshot(): Set<Shape> {
+    return new Set(this.shapes);
+  }
+
+  /**
+   * Whether any **new** stroke segment (strict interior intersection) crosses a segment from
+   * shapes present in `priorShapes`. Ignores intersections whose crossing lies within
+   * `exemptRadiusPx` of any `exemptPts` (nest / evolve anchors and apex).
+   *
+   * When `nestChord` is set, segment pairs **both** lying in a slab along that anchor chord are
+   * ignored, and strict crossings whose **intersection** lies in the same chord corridor are
+   * ignored. The corridor half-width scales with chord length (default `chordSlabPx` is only a
+   * floor): base arcs bulge by about `bigBend * chordLen`, so a few-pixel slab never contained
+   * flattened arc segments and caused false positives / retry thrash.
+   */
+  newStrokesCrossPriorFigure(
+    priorShapes: Set<Shape>,
+    exemptPts: Point[],
+    exemptRadiusPx = 2.5,
+    samplesPerQuad = 6,
+    nestChord?: [Point, Point],
+    chordSlabPx = 4
+  ): boolean {
+    const n = Math.max(4, Math.floor(samplesPerQuad));
+    const priorSegs: Array<[Point, Point]> = [];
+    const neuSegs: Array<[Point, Point]> = [];
+    for (const s of this.shapes) {
+      const bucket = priorShapes.has(s) ? priorSegs : neuSegs;
+      this.appendStrokeSegmentsForShape(s, n, bucket);
+    }
+    const exemptR2 = exemptRadiusPx * exemptRadiusPx;
+    const nearExempt = (p: Point) =>
+      exemptPts.some((e) => {
+        const dx = p.x - e.x;
+        const dy = p.y - e.y;
+        return dx * dx + dy * dy <= exemptR2;
+      });
+    let chordSlabSkip:
+      | ((a: Point, b: Point, c: Point, d: Point) => boolean)
+      | null = null;
+    let crossingInChordCorridor: ((ix: number, iy: number) => boolean) | null = null;
+    if (nestChord) {
+      const L0 = nestChord[0];
+      const L1 = nestChord[1];
+      const cdx = L1.x - L0.x;
+      const cdy = L1.y - L0.y;
+      const chordLen = Math.hypot(cdx, cdy) || 1;
+      const chordLen2 = cdx * cdx + cdy * cdy;
+      /** Half-width of band along anchor chord that hosts duplicate p1–p2 base geometry. */
+      const corridorW = Math.min(
+        220,
+        Math.max(chordSlabPx, 0.3 * chordLen + 14)
+      );
+      chordSlabSkip = (a, b, c, d) =>
+        segmentInChordSlab(a, b, L0, L1, corridorW) &&
+        segmentInChordSlab(c, d, L0, L1, corridorW);
+      crossingInChordCorridor = (ix: number, iy: number) => {
+        if (distPointToLine({ x: ix, y: iy }, L0, L1) >= corridorW) return false;
+        const t =
+          ((ix - L0.x) * cdx + (iy - L0.y) * cdy) / (chordLen2 || 1);
+        return t >= -0.05 && t <= 1.05;
+      };
+    }
+    for (const [a, b] of neuSegs) {
+      for (const [c, d] of priorSegs) {
+        if (!segmentAabbOverlap(a, b, c, d)) continue;
+        if (chordSlabSkip?.(a, b, c, d)) continue;
+        if (!segmentsIntersectOpenBothStrict(a, b, c, d)) continue;
+        const rx = b.x - a.x;
+        const ry = b.y - a.y;
+        const sx = d.x - c.x;
+        const sy = d.y - c.y;
+        const qpx = c.x - a.x;
+        const qpy = c.y - a.y;
+        const denom = rx * sy - ry * sx;
+        if (Math.abs(denom) < 1e-14) continue;
+        const t = (qpx * sy - qpy * sx) / denom;
+        const ix = a.x + t * rx;
+        const iy = a.y + t * ry;
+        if (nearExempt({ x: ix, y: iy })) continue;
+        if (crossingInChordCorridor?.(ix, iy)) continue;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private appendStrokeSegmentsForShape(
+    shape: Shape,
+    n: number,
+    out: Array<[Point, Point]>
+  ): void {
+    const pushQuadChain = (p0: Point, pc: Point, p2: Point) => {
+      let prev = p0;
+      for (let i = 1; i <= n; i++) {
+        const t = i / n;
+        const q = quadAt(p0, pc, p2, t);
+        out.push([prev, q]);
+        prev = q;
+      }
+    };
+    const walkRegionBoundary = (region: Region) => {
+      let cur = region.start;
+      for (const seg of region.segments) {
+        if (seg.kind === "line") {
+          out.push([cur, seg.to]);
+          cur = seg.to;
+        } else {
+          pushQuadChain(cur, seg.ctrl, seg.to);
+          cur = seg.to;
+        }
+      }
+    };
+    if (shape instanceof LineSeg) {
+      out.push([shape.p1, shape.p2]);
+    } else if (shape instanceof ArcSeg) {
+      const c = perpControl(shape.p1, shape.p2, shape.bend);
+      pushQuadChain(shape.p1, c, shape.p2);
+    } else if (shape instanceof QuadBezier) {
+      pushQuadChain(shape.p0, shape.p1, shape.p2);
+    } else if (shape instanceof Region) {
+      walkRegionBoundary(shape);
+    } else if (shape instanceof Group) {
+      for (const ch of shape.children) {
+        this.appendStrokeSegmentsForShape(ch, n, out);
+      }
+    } else if (shape instanceof Blade) {
+      for (const ch of shape.getStrokeSubshapes()) {
+        this.appendStrokeSegmentsForShape(ch, n, out);
+      }
+    }
   }
 
   /**

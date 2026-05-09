@@ -386,3 +386,27 @@ export const quadSubSegment = (
 
 export const quadPath = (p0: Point, p1: Point, p2: Point): string =>
   `M ${p0.x} ${p0.y} Q ${p1.x} ${p1.y} ${p2.x} ${p2.y}`;
+
+/**
+ * True iff segments **(a→b)** and **(c→d)** meet at a point strictly in the interior
+ * of **both** open segments (excludes endpoint-only touches / shared joints).
+ */
+export const segmentsIntersectOpenBothStrict = (
+  a: Point,
+  b: Point,
+  c: Point,
+  d: Point,
+  eps = 1e-5
+): boolean => {
+  const rx = b.x - a.x;
+  const ry = b.y - a.y;
+  const sx = d.x - c.x;
+  const sy = d.y - c.y;
+  const qpx = c.x - a.x;
+  const qpy = c.y - a.y;
+  const denom = rx * sy - ry * sx;
+  if (Math.abs(denom) < 1e-14) return false;
+  const t = (qpx * sy - qpy * sx) / denom;
+  const u = (qpx * ry - qpy * rx) / denom;
+  return t > eps && t < 1 - eps && u > eps && u < 1 - eps;
+};

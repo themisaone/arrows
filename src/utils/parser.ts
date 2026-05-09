@@ -67,6 +67,16 @@ import {
  *                                      # inside an already-filled region (tube/spike area).
  *                                      # Default **12**. Emits soft {@link ParseResult.infos}
  *                                      # lines for retries / skipped branches.
+ *   const nestCollisionCheck 0|1       # optional. When **1**, after a successful apex (not inside a
+ *                                      # prior fill), reject an emit when **new** stroke segments (arcs,
+ *                                      # lines, region outlines, blades) have a **strict interior**
+ *                                      # intersection with any **prior** segment; joints near nest
+ *                                      # anchors / apex are ignored; chord-corridor logic reduces false
+ *                                      # positives on the shared **p1–p2** re-draw. Retries use
+ *                                      # **nestLayoutMaxAttempts** (failed attempts roll back `buildSteps`
+ *                                      in stepped mode too). **infer nest** / **auto-nest**: stepped and
+ *                                      # non-stepped. **evolve**: non-stepped only (stepped `evolve` still
+ *                                      # skips collision). Default **0** (off). Approximate (flattened arcs).
  *   const nestApexPlacement 2         # (kept for backward compatibility; nesting now
  *                                      # always uses arc-based Option 2)
  *                                      # choose LEFT/RIGHT (toward first/second anchor
@@ -165,8 +175,9 @@ import {
  *                                      # chosen corner to the bridge (no straight chord). **in** / **inn**
  *                                      # = rimward wedge; **out** = interior wedge (other base corner).
  *                                      # **off** = no fill (default if unset).
- *   const fillApexShapeColor #RGB      # optional fill (`#RRGGBB` or `#RGB`); line comments must use
- *                                      # a **space** before `#` only after the hex (e.g. `#ccc # note`).
+ *   const fillApexShapeColor #RGB      # optional fill (`#RRGGBB` or `#RGB`). After a hex token, put a
+ *                                      # **space** before an end-of-line `#` comment (e.g. `#ccc # note`).
+ *                                      # Lines whose first non-space character is `#` are full-line comments.
  *   const fillTubeShape in|out|off     # optional. After each `tube` / `spike` (opaque interior + side +
  *                                      # cap arcs), when this is not **off** *or* **addMiddleArcs** is on,
  *                                      # draw a **black** bridge between the **hub-seal midpoint** **P1–P2**
@@ -374,8 +385,12 @@ const TUBE_FILL = "white";
 /**
  * Strip `#…` end-of-line comments without eating `#RRGGBB` / `#RGB` colour tokens
  * (e.g. `const fillApexShapeColor #cccccc` must keep the hex).
+ * Whole-line comments (`# …` at column 0 after trim) are removed — the inline
+ * rule only strips `#` that are preceded by whitespace so hex at line start stays valid.
  */
 function stripHashLineComment(line: string): string {
+  const trimmed = line.trim();
+  if (trimmed.startsWith("#")) return "";
   return line
     .replace(/\s+#(?!(?:[0-9a-f]{3}|[0-9a-f]{6})(?:\s|$|#)).*$/i, "")
     .trim();
@@ -1163,6 +1178,10 @@ export function parse(
     return 12;
   };
 
+  /** When true, reject nest / evolve emits whose new strokes strictly cross prior figure strokes. */
+  const nestCollisionCheck = (): boolean =>
+    consts.has("nestCollisionCheck") && consts.get("nestCollisionCheck")! !== 0;
+
   /** Percent chance (0..100) to force inferred/auto nests to `in`+`in` near midpoint. */
   const doubleInnProbabilityPct = (): number => {
     if (!consts.has("doubleInnProbability")) return 0;
@@ -1644,62 +1663,6 @@ export function parse(
             : cand
         );
     });
-  };
-
-  /**
-   * Fallback when `nest P1 P2` anchors are not registered (not from our `Tia`/`Tib`
-   * minting): random L/R ⊥, same distance and parallel-slide bands as `perp`.
-   */
-  const placeNestApexRandomLr = (name: string, p1: string, p2: string) => {
-    const chordHL: HelperLineSpec[] = [{ from: p1, to: p2 }];
-    if (explicitPointLineNames.has(name) && fig.has(name)) {
-      pushStep(
-        `nest: apex ${name} already explicit — skip auto placement`,
-        chordHL,
-        () => {}
-      );
-      return;
-    }
-    if (stepped) {
-      const plan = planNestArcApexLayout(fig, name, p1, p2, null, 0);
-      if (plan) {
-        pushStep(
-          `nest apex (arc): Selected ${plan.sideLabel} — guide arc from midpoint of ${p1}–${p2} toward ${plan.centerName} side (no host ref)`,
-          chordHL,
-          () => {}
-        );
-        pushStep(
-          `nest apex (arc): thin gray = deciding circle (center ${plan.centerName}); magenta = admissible arc; gray ticks = ⊥ cuts`,
-          chordHL,
-          () => {},
-          {
-            helperPolylines: [
-              { points: plan.circlePolyline, stroke: "#94a3b8", strokeWidth: 1.2 },
-              { points: plan.arcPolyline, stroke: "#a21caf", strokeWidth: 2.5 },
-            ],
-            helperSegments: [...plan.bisectorTicks, { a: plan.centerPoint, b: plan.apex }],
-            helperDots: [plan.centerPoint],
-          }
-        );
-        pushStep(
-          `nest apex (arc): place ${name} on the arc`,
-          chordHL,
-          (f) => {
-            f.point(name, plan.apex);
-          },
-          { helperDots: [plan.apex] }
-        );
-        return;
-      }
-    }
-    pushStep(
-      `nest: place apex ${name} — constrained arc on circle from ${p1}|${p2} (anchors had no host body)`,
-      chordHL,
-      (f) => {
-        if (explicitPointLineNames.has(name) && f.has(name)) return;
-        computeNestApexOnFigure(f, name, p1, p2, null, 0);
-      }
-    );
   };
 
   /**
@@ -2606,7 +2569,7 @@ export function parse(
     /** Enable probabilistic inferred-mode `in`+`in` override near midpoint. */
     allowDoubleInn?: boolean;
   }) => {
-    const maxT = stepped ? 1 : nestLayoutMaxAttempts();
+    const maxT = nestLayoutMaxAttempts();
     const wave = opts.nextWave ?? [];
     const cp = saveParseCheckpoint(wave);
     const trackFp = opts.trackFreePointApex !== false;
@@ -2628,7 +2591,6 @@ export function parse(
         restoreParseCheckpoint(cp, wave);
         return;
       }
-      if (trackFp) freePoints.push(opts.p3);
       let d13: "in" | "out" = "out";
       let d23: "in" | "out" = "in";
       const r = resolveNestSideSwap(opts.p1, opts.p2, opts.p3, fig);
@@ -2656,6 +2618,7 @@ export function parse(
       }
       const meta =
         opts.nestUserScriptedMetaFn?.(r) ?? opts.nestUserScriptedMeta;
+      const priorSnap = fig.priorShapeSnapshot();
       emitNestGeometry(
         opts.p1,
         opts.p2,
@@ -2667,6 +2630,29 @@ export function parse(
         opts.stepNotePrefix,
         opts.arrowTerminal
       );
+      if (
+        nestCollisionCheck() &&
+        fig.newStrokesCrossPriorFigure(
+          priorSnap,
+          [fig.pt(opts.p1), fig.pt(opts.p2), fig.pt(opts.p3)],
+          2.5,
+          6,
+          [fig.pt(opts.p1), fig.pt(opts.p2)]
+        )
+      ) {
+        if (k < maxT - 1) {
+          infos.push(
+            `${opts.label}: RETRY ${k + 2}/${maxT} — new nest geometry crosses existing strokes.`
+          );
+          continue;
+        }
+        infos.push(
+          `${opts.label}: geometry still crosses existing strokes after ${maxT} tries — branch skipped.`
+        );
+        restoreParseCheckpoint(cp, wave);
+        return;
+      }
+      if (trackFp) freePoints.push(opts.p3);
       infos.push(
         `${opts.label}: apex accepted on attempt ${k + 1}/${maxT}.`
       );
@@ -2700,73 +2686,28 @@ export function parse(
             const arrowTerminal =
               continuationEndArrow() && passMax > 1 && pass === passMax - 1;
             const stepPf = `${stepNotePrefix}[auto nest pass ${pass + 1}/${passMax}, pair ${wi + 1}/${wave.length}] `;
-            if (!stepped) {
-              runNestWithApexLayoutRetries({
-                p1: na,
-                p2: nb,
-                p3: p3a,
-                nextWave,
-                placeApexSilent: (tryIdx) => {
-                  computeNestApexOnFigure(
-                    fig,
-                    p3a,
-                    na,
-                    nb,
-                    hostBody ?? null,
-                    tryIdx,
-                    pass === passMax - 1
-                  );
-                },
-                nestUserScriptedMeta: undefined,
-                stepNotePrefix: stepPf,
-                arrowTerminal,
-                label: `Auto nest ${na}–${nb}`,
-                allowDoubleInn: true,
-              });
-            } else {
-              if (hostBody) {
-                placePerpAwayFrom(p3a, na, nb, hostBody, "nest");
-              } else {
-                placeNestApexRandomLr(p3a, na, nb);
-              }
-              freePoints.push(p3a);
-              let da13: "in" | "out" = "out";
-              let da23: "in" | "out" = "in";
-              const rAuto = resolveNestSideSwap(na, nb, p3a, fig);
-              const swapRuleAuto = rAuto.swapRule;
-              if (rAuto.swap) {
-                da13 = "in";
-                da23 = "out";
-              }
-              if (!arrowTerminal) {
-                const mAuto = maybeApplyDoubleInn(
+            runNestWithApexLayoutRetries({
+              p1: na,
+              p2: nb,
+              p3: p3a,
+              nextWave,
+              placeApexSilent: (tryIdx) => {
+                computeNestApexOnFigure(
+                  fig,
+                  p3a,
                   na,
                   nb,
-                  p3a,
-                  da13,
-                  da23,
-                  `${na}|${nb}|${p3a}|auto`
+                  hostBody ?? null,
+                  tryIdx,
+                  pass === passMax - 1
                 );
-                da13 = mAuto.d13;
-                da23 = mAuto.d23;
-                if (mAuto.applied) {
-                  infos.push(
-                    `Auto nest ${na}–${nb}: doubleInn applied (disp ${mAuto.displacementPct.toFixed(1)}% < 50%).`
-                  );
-                }
-              }
-              emitNestGeometry(
-                na,
-                nb,
-                p3a,
-                da13,
-                da23,
-                undefined,
-                swapRuleAuto,
-                stepPf,
-                arrowTerminal
-              );
-            }
+              },
+              nestUserScriptedMeta: undefined,
+              stepNotePrefix: stepPf,
+              arrowTerminal,
+              label: `Auto nest ${na}–${nb}`,
+              allowDoubleInn: true,
+            });
           }
         } finally {
           continuationAnchorSink = null;
@@ -3395,53 +3336,75 @@ export function parse(
             );
           } else {
             const maxT = nestLayoutMaxAttempts();
-            let ok = false;
+            const cpEvolve = saveParseCheckpoint([]);
+            let accepted = false;
             for (let k = 0; k < maxT; k++) {
+              restoreParseCheckpoint(cpEvolve, []);
               placeEvolveApex(fig, k);
               const ap = fig.pt(apexNm);
-              if (!fig.isPointInsideAnyFilledRegion(ap)) {
-                ok = true;
-                break;
+              if (fig.isPointInsideAnyFilledRegion(ap)) {
+                if (k < maxT - 1) {
+                  infos.push(
+                    `evolve ${p1n} ${p2n}: RETRY ${k + 2}/${maxT} — apex inside filled area.`
+                  );
+                }
+                continue;
               }
-              if (k < maxT - 1) {
-                infos.push(
-                  `evolve ${p1n} ${p2n}: RETRY ${k + 2}/${maxT} — apex inside filled area.`
-                );
+              const rngD12 = mulberry32(seedFor(`${p1n}|${p2n}|evolveD12`));
+              const d12: "in" | "out" =
+                rngD12() * 100 < doubleInnProbabilityPct() ? "in" : "out";
+              let d13: "in" | "out" = "out";
+              let d23: "in" | "out" = "in";
+              const r = resolveNestSideSwap(p1n, p2n, apexNm, fig);
+              if (r.swap) {
+                d13 = "in";
+                d23 = "out";
               }
-            }
-            if (!ok) {
-              infos.push(
-                `evolve ${p1n} ${p2n}: apex remained inside filled areas after ${maxT} tries — skipped.`
-              );
+              const priorSnap = fig.priorShapeSnapshot();
+              emitThornyTriangle(p1n, p2n, apexNm, d12, d13, d23, "evolve: ");
+              if (
+                nestCollisionCheck() &&
+                fig.newStrokesCrossPriorFigure(
+                  priorSnap,
+                  [fig.pt(p1n), fig.pt(p2n), ap],
+                  2.5,
+                  6,
+                  [fig.pt(p1n), fig.pt(p2n)]
+                )
+              ) {
+                if (k < maxT - 1) {
+                  infos.push(
+                    `evolve ${p1n} ${p2n}: RETRY ${k + 2}/${maxT} — new geometry crosses existing strokes.`
+                  );
+                }
+                continue;
+              }
+              if (
+                !implicitEvolveApexes.some(
+                  (e) => e.apex === apexNm && e.lineNum === scriptLineNum
+                )
+              ) {
+                implicitEvolveApexes.push({
+                  apex: apexNm,
+                  p1: p1n,
+                  p2: p2n,
+                  d12,
+                  d13,
+                  d23,
+                  lineNum: scriptLineNum,
+                });
+              }
+              freePoints.push(apexNm);
+              accepted = true;
               break;
             }
-            freePoints.push(apexNm);
-            const rngD12 = mulberry32(seedFor(`${p1n}|${p2n}|evolveD12`));
-            const d12: "in" | "out" =
-              rngD12() * 100 < doubleInnProbabilityPct() ? "in" : "out";
-            let d13: "in" | "out" = "out";
-            let d23: "in" | "out" = "in";
-            const r = resolveNestSideSwap(p1n, p2n, apexNm, fig);
-            if (r.swap) {
-              d13 = "in";
-              d23 = "out";
+            if (!accepted) {
+              infos.push(
+                `evolve ${p1n} ${p2n}: could not place apex / geometry after ${maxT} tries — skipped.`
+              );
+              restoreParseCheckpoint(cpEvolve, []);
+              break;
             }
-            if (
-              !implicitEvolveApexes.some(
-                (e) => e.apex === apexNm && e.lineNum === scriptLineNum
-              )
-            ) {
-              implicitEvolveApexes.push({
-                apex: apexNm,
-                p1: p1n,
-                p2: p2n,
-                d12,
-                d13,
-                d23,
-                lineNum: scriptLineNum,
-              });
-            }
-            emitThornyTriangle(p1n, p2n, apexNm, d12, d13, d23, "evolve: ");
           }
           break;
         }
@@ -3491,78 +3454,38 @@ export function parse(
             p3 = inferred;
             const hostBody =
               nestAnchorHostBody.get(p1) ?? nestAnchorHostBody.get(p2);
-            if (!stepped) {
-              runNestWithApexLayoutRetries({
-                p1,
-                p2,
-                p3,
-                nextWave: null,
-                placeApexSilent: (tryIdx) => {
-                  computeNestApexOnFigure(
-                    fig,
-                    p3,
-                    p1,
-                    p2,
-                    hostBody ?? null,
-                    tryIdx
-                  );
-                },
-                implicitPush: (d13r, d23r) => {
-                  implicitNestApexes.push({
-                    apex: p3,
-                    p1,
-                    p2,
-                    d13: d13r,
-                    d23: d23r,
-                    lineNum: scriptLineNum,
-                  });
-                },
-                nestUserScriptedMeta: undefined,
-                stepNotePrefix: "",
-                arrowTerminal: false,
-                label: `nest ${p1} ${p2}→${p3}`,
-                allowDoubleInn: true,
-              });
-              nestEmitDone = true;
-            } else {
-              if (hostBody) {
-                placePerpAwayFrom(p3, p1, p2, hostBody, "nest");
-              } else {
-                placeNestApexRandomLr(p3, p1, p2);
-              }
-              freePoints.push(p3);
-              d13 = "out";
-              d23 = "in";
-              const r3 = resolveNestSideSwap(p1, p2, p3, fig);
-              nestSwapRule = r3.swapRule;
-              if (r3.swap) {
-                d13 = "in";
-                d23 = "out";
-              }
-              const m3 = maybeApplyDoubleInn(
-                p1,
-                p2,
-                p3,
-                d13,
-                d23,
-                `${p1}|${p2}|${p3}|nest3`
-              );
-              d13 = m3.d13;
-              d23 = m3.d23;
-              if (m3.applied) {
-                infos.push(
-                  `nest ${p1} ${p2}: doubleInn applied (disp ${m3.displacementPct.toFixed(1)}% < 50%).`
+            runNestWithApexLayoutRetries({
+              p1,
+              p2,
+              p3,
+              nextWave: null,
+              placeApexSilent: (tryIdx) => {
+                computeNestApexOnFigure(
+                  fig,
+                  p3,
+                  p1,
+                  p2,
+                  hostBody ?? null,
+                  tryIdx
                 );
-              }
-              implicitNestApexes.push({
-                apex: p3,
-                p1,
-                p2,
-                d13,
-                d23,
-                lineNum: scriptLineNum,
-              });
-            }
+              },
+              implicitPush: (d13r, d23r) => {
+                implicitNestApexes.push({
+                  apex: p3,
+                  p1,
+                  p2,
+                  d13: d13r,
+                  d23: d23r,
+                  lineNum: scriptLineNum,
+                });
+              },
+              nestUserScriptedMeta: undefined,
+              stepNotePrefix: "",
+              arrowTerminal: false,
+              label: `nest ${p1} ${p2}→${p3}`,
+              allowDoubleInn: true,
+            });
+            nestEmitDone = true;
           } else if (tokens.length === 4) {
             let refTok: string;
             [, p1, p2, refTok] = tokens;
@@ -3574,69 +3497,32 @@ export function parse(
               );
             }
             p3 = inferred;
-            if (!stepped) {
-              runNestWithApexLayoutRetries({
-                p1,
-                p2,
-                p3,
-                nextWave: null,
-                placeApexSilent: (tryIdx) => {
-                  computeNestApexOnFigure(fig, p3, p1, p2, refTok, tryIdx);
-                },
-                implicitPush: (d13r, d23r) => {
-                  implicitNestApexes.push({
-                    apex: p3,
-                    p1,
-                    p2,
-                    awayRef: refTok,
-                    d13: d13r,
-                    d23: d23r,
-                    lineNum: scriptLineNum,
-                  });
-                },
-                nestUserScriptedMeta: undefined,
-                stepNotePrefix: "",
-                arrowTerminal: false,
-                label: `nest ${p1} ${p2} ${refTok}→${p3}`,
-                allowDoubleInn: true,
-              });
-              nestEmitDone = true;
-            } else {
-              placePerpAwayFrom(p3, p1, p2, refTok, "nest");
-              freePoints.push(p3);
-              d13 = "out";
-              d23 = "in";
-              const r4 = resolveNestSideSwap(p1, p2, p3, fig);
-              nestSwapRule = r4.swapRule;
-              if (r4.swap) {
-                d13 = "in";
-                d23 = "out";
-              }
-              const m4 = maybeApplyDoubleInn(
-                p1,
-                p2,
-                p3,
-                d13,
-                d23,
-                `${p1}|${p2}|${p3}|nest4`
-              );
-              d13 = m4.d13;
-              d23 = m4.d23;
-              if (m4.applied) {
-                infos.push(
-                  `nest ${p1} ${p2} ${refTok}: doubleInn applied (disp ${m4.displacementPct.toFixed(1)}% < 50%).`
-                );
-              }
-              implicitNestApexes.push({
-                apex: p3,
-                p1,
-                p2,
-                awayRef: refTok,
-                d13,
-                d23,
-                lineNum: scriptLineNum,
-              });
-            }
+            runNestWithApexLayoutRetries({
+              p1,
+              p2,
+              p3,
+              nextWave: null,
+              placeApexSilent: (tryIdx) => {
+                computeNestApexOnFigure(fig, p3, p1, p2, refTok, tryIdx);
+              },
+              implicitPush: (d13r, d23r) => {
+                implicitNestApexes.push({
+                  apex: p3,
+                  p1,
+                  p2,
+                  awayRef: refTok,
+                  d13: d13r,
+                  d23: d23r,
+                  lineNum: scriptLineNum,
+                });
+              },
+              nestUserScriptedMeta: undefined,
+              stepNotePrefix: "",
+              arrowTerminal: false,
+              label: `nest ${p1} ${p2} ${refTok}→${p3}`,
+              allowDoubleInn: true,
+            });
+            nestEmitDone = true;
           } else if (tokens.length === 6) {
             let d13Raw: string;
             let d23Raw: string;
@@ -3674,44 +3560,26 @@ export function parse(
             [, p1, p2, p3, , refTok, d13Raw, d23Raw] = tokens;
             const u13b = parseDir(d13Raw);
             const u23b = parseDir(d23Raw);
-            if (!stepped) {
-              runNestWithApexLayoutRetries({
-                p1,
-                p2,
-                p3,
-                nextWave: null,
-                placeApexSilent: (tryIdx) => {
-                  computeNestApexOnFigure(fig, p3, p1, p2, refTok, tryIdx);
-                },
-                nestUserScriptedMetaFn: (r) => ({
-                  d13: u13b,
-                  d23: u23b,
-                  swapped: r.swap,
-                }),
-                nestUserScriptedMeta: undefined,
-                stepNotePrefix: "",
-                arrowTerminal: false,
-                label: `nest ${p1} ${p2} ${p3} awayFrom ${refTok}`,
-                trackFreePointApex: false,
-              });
-              nestEmitDone = true;
-            } else {
-              placePerpAwayFrom(p3, p1, p2, refTok, "nest");
-              d13 = u13b;
-              d23 = u23b;
-              const r8 = resolveNestSideSwap(p1, p2, p3, fig);
-              nestSwapRule = r8.swapRule;
-              if (r8.swap) {
-                const t = d13;
-                d13 = d23;
-                d23 = t;
-              }
-              nestUserScriptedMeta = {
+            runNestWithApexLayoutRetries({
+              p1,
+              p2,
+              p3,
+              nextWave: null,
+              placeApexSilent: (tryIdx) => {
+                computeNestApexOnFigure(fig, p3, p1, p2, refTok, tryIdx);
+              },
+              nestUserScriptedMetaFn: (r) => ({
                 d13: u13b,
                 d23: u23b,
-                swapped: r8.swap,
-              };
-            }
+                swapped: r.swap,
+              }),
+              nestUserScriptedMeta: undefined,
+              stepNotePrefix: "",
+              arrowTerminal: false,
+              label: `nest ${p1} ${p2} ${p3} awayFrom ${refTok}`,
+              trackFreePointApex: false,
+            });
+            nestEmitDone = true;
           } else {
             throw new Error(
               "usage: nest P1 P2  |  nest P1 P2 REF  |  nest P1 P2 P3 in|out in|out  |  " +
